@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import dataclasses
 import logging
 import queue
 import threading
@@ -7,12 +8,32 @@ import time
 
 import aiohttp
 
+from miles.rollout.base_types import EnginePreemptedError, RLixRouterMetadataError
 from miles.rollout.data_source import DataSource
 from miles.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from miles.utils.async_utils import run
+from miles.utils.rlix_hooks import NoOpRLixHooks, RLixHooks
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class _FatalError:
+    """F01 fully_async fatal-error sentinel — single-path queue signal.
+
+    The queue ``output_queue`` is the ONE place fully_async surfaces
+    fatal errors; the per-worker ``task_done_callback`` puts an
+    instance of this sentinel onto the queue and the main loop dequeues
+    + ``raise``s. Anti-regression invariant #9 / scope F01 forbids any
+    parallel ``_fatal_error`` flag attribute on AsyncRolloutWorker.
+
+    ``inner`` is the original exception (typically
+    :class:`EnginePreemptedError` or :class:`RLixRouterMetadataError`)
+    for callers that want to inspect the cause.
+    """
+
+    inner: BaseException
 
 
 def group_oldest_weight_version(group: list[Sample]) -> int | None:
@@ -127,10 +148,20 @@ class AsyncRolloutWorker:
                             )
                         )
 
-                        # Add completion callback
+                        # Add completion callback. F01: route the two
+                        # RLix-classified scheduler-preempt exceptions
+                        # (EnginePreemptedError, RLixRouterMetadataError)
+                        # through the single _FatalError sentinel path
+                        # on output_queue. Other exceptions propagate via
+                        # done_task.result() — caller sees them as a
+                        # regular task failure (existing behavior).
                         def make_callback(gid):
                             def task_done_callback(done_task):
-                                result = done_task.result()
+                                try:
+                                    result = done_task.result()
+                                except (EnginePreemptedError, RLixRouterMetadataError) as fatal:
+                                    self.output_queue.put((gid, _FatalError(inner=fatal)))
+                                    return
                                 self.output_queue.put((gid, result))
 
                             return task_done_callback
@@ -186,11 +217,25 @@ class AsyncRolloutWorker:
         return self.output_queue.qsize()
 
 
-async def generate_rollout_async(args, rollout_id: int, data_buffer: DataSource) -> list[list[Sample]]:
+async def generate_rollout_async(
+    args,
+    rollout_id: int,
+    data_buffer: DataSource,
+    *,
+    rlix_hooks: RLixHooks | None = None,
+) -> list[list[Sample]]:
     """
-    Simplified asynchronous rollout generation - using global continuous worker
+    Simplified asynchronous rollout generation - using global continuous worker.
+
+    ``rlix_hooks`` (F9 progress reporting): standalone callers pass
+    ``None`` and get a :class:`NoOpRLixHooks` instance internally so the
+    code path is branchless. RLix mode injects a real
+    :class:`MilesRLixHooks` wrapping the coordinator handle.
     """
     assert args.rollout_global_dataset
+
+    if rlix_hooks is None:
+        rlix_hooks = NoOpRLixHooks()
 
     # Get global worker, which will run continuously
     worker = get_global_worker(args, data_buffer)
@@ -211,6 +256,20 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer: DataSource)
     if use_staleness_filter:
         print(f"Staleness filter enabled: max_weight_staleness={args.max_weight_staleness}")
 
+    # F9 progress hook: open the batch BEFORE the wait window so the
+    # coordinator can publish the demand. M11 hook signature expects
+    # (target_weight_version, step_target_groups, initial_completed,
+    # mode=None, adapter_id=None). data is empty at this point per
+    # plan; queued groups in worker.output_queue arrive via
+    # bump_completed below. mode/adapter_id stay None for forward-
+    # compat with M11.4 LoRA (X1 / F108).
+    current_weight_version = 0  # filled below if /model_info responds
+    rlix_hooks.begin_progress_batch(
+        target_weight_version=int(current_weight_version),
+        step_target_groups=int(target_data_size),
+        initial_completed=0,
+    )
+
     # Main loop: collect results from global worker's output queue
     start_time = time.time()
     last_progress_time = start_time
@@ -222,6 +281,13 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer: DataSource)
 
         made_progress = False
         for group_id, group in completed:
+            # F01 / Anti-regression invariant #9: dequeue _FatalError
+            # sentinel and raise the inner exception. Single-path
+            # propagation; do NOT also check a parallel _fatal_error
+            # flag — that is forbidden.
+            if isinstance(group, _FatalError):
+                rlix_hooks.end_progress_batch()
+                raise group.inner
             completed_groups[group_id] = group
             made_progress = True
 
@@ -293,6 +359,13 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer: DataSource)
 
             # Simplified: directly add samples, no filters used
             data.append(group)
+            # F9 progress: report one completed group per accepted
+            # group. The coordinator throttles its own emission; this
+            # is the raw "collected" count fully_async produces.
+            try:
+                rlix_hooks.bump_completed(target_weight_version=int(current_weight_version))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"rlix_hooks.bump_completed failed: {exc!r}")
             processed_any = True
 
         # Check progress
@@ -327,14 +400,31 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer: DataSource)
         )
 
     data = sorted(data, key=lambda group: group[0].index)
+    rlix_hooks.end_progress_batch()
     return data
 
 
-def generate_rollout_fully_async(args, rollout_id, data_buffer: DataSource, evaluation=False):
+def generate_rollout_fully_async(
+    args,
+    rollout_id,
+    data_buffer: DataSource,
+    evaluation=False,
+    *,
+    rlix_hooks: RLixHooks | None = None,
+):
+    """Sync entry the existing rollout_function_path resolves to.
+
+    ``rlix_hooks`` is forwarded to :func:`generate_rollout_async`;
+    standalone callers pass ``None`` (NoOp). RLix entry driver injects
+    :class:`MilesRLixHooks` to wire progress reporting into the
+    coordinator.
+    """
     if evaluation:
         raise ValueError("Evaluation mode not supported in simple async rollout")
 
-    completed_samples = run(generate_rollout_async(args, rollout_id, data_buffer))
+    completed_samples = run(
+        generate_rollout_async(args, rollout_id, data_buffer, rlix_hooks=rlix_hooks)
+    )
     return completed_samples
 
 
