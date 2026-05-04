@@ -46,6 +46,14 @@ class MilesRouter:
         #   registry. Forbidden hardening (bounded timeout + 503 sentinel +
         #   client EnginePreemptedError translation) is M11.5 (F79).
         self._workers_changed: asyncio.Condition = asyncio.Condition()
+        # _admission_declared distinguishes "admission has been declared at
+        # least once" (post-add_worker / disable_worker / enable_worker /
+        # remove_worker) from "admission has never been declared". The
+        # legacy / test compat fallback fires only in the latter case so a
+        # later "shrink to 0 then disable last worker" leaves the candidate
+        # set genuinely empty (not silently wrapped back to the full
+        # registry).
+        self._admission_declared: bool = False
 
         # F3 admission lifecycle (scope F39 / F14):
         #   - worker_request_counts: URL → in-flight count (also doubles as the
@@ -197,7 +205,7 @@ class MilesRouter:
         headers: dict | None = None,
     ) -> dict:
         """Core proxy logic. Returns dict with request_body, response_body, status_code, headers."""
-        worker_url = await self._use_url()
+        worker_url = await self._use_url_async()
         url = f"{worker_url}/{path}"
 
         if body is None:
@@ -349,6 +357,7 @@ class MilesRouter:
         self.enabled_workers.add(url)
         if engine_index is not None:
             self.worker_engine_index_map[url] = engine_index
+        self._admission_declared = True
         if self.verbose:
             print(f"[miles-router] Added worker: {url} (engine_index={engine_index})")
 
@@ -359,6 +368,7 @@ class MilesRouter:
         self.dead_workers.discard(url)
         self.enabled_workers.discard(url)
         self.worker_engine_index_map.pop(url, None)
+        self._admission_declared = True
         if self.verbose:
             print(f"[miles-router] Removed worker: {url}")
 
@@ -368,6 +378,7 @@ class MilesRouter:
         """
         self.enabled_workers.discard(url)
         self.worker_failure_counts[url] = 0
+        self._admission_declared = True
         if self.verbose:
             print(f"[miles-router] Disabled worker: {url}")
 
@@ -380,20 +391,48 @@ class MilesRouter:
         self.worker_failure_counts[url] = 0
         self.dead_workers.discard(url)
         self.enabled_workers.add(url)
+        self._admission_declared = True
         if self.verbose:
             print(f"[miles-router] Enabled worker: {url}")
 
     def _candidate_set(self) -> set[str]:
         """Return the routable URL set used by both _use_url and the health
-        loop. Honors enabled_workers when admission has been declared, or
-        falls back to the full registry for legacy / test callers.
+        loop.
+
+        Once admission has been declared (any of the four lifecycle
+        endpoints / helpers fired), ``enabled_workers - dead_workers`` is
+        the strict source of truth — even when that set is empty (which
+        is exactly the 0-active suspend trigger).
+
+        Pre-admission (legacy / direct test fixtures), fall back to the
+        full registry minus dead_workers so existing callers continue to
+        work.
         """
-        if self.enabled_workers:
+        if self._admission_declared:
             return self.enabled_workers - self.dead_workers
         return set(self.worker_request_counts) - self.dead_workers
 
-    async def _use_url(self):
-        """Select an admitted worker URL with minimal active requests.
+    def _use_url(self):
+        """Synchronous, raise-on-empty selector.
+
+        Kept as the legacy compat path for direct callers and tests
+        (``tests/fast/router/test_router.py::TestLoadBalancing``) that
+        construct a router and invoke ``_use_url()`` synchronously
+        without going through ``do_proxy``.
+
+        Production proxy goes through :meth:`_use_url_async` (which
+        suspends per C20). This sync method does NOT suspend — it raises
+        if no candidate is available.
+        """
+        candidates = self._candidate_set()
+        if not candidates:
+            raise RuntimeError("No enabled live workers available in the pool")
+        url = min(candidates, key=lambda u: self.worker_request_counts.get(u, 0))
+        self.worker_request_counts[url] += 1
+        return url
+
+    async def _use_url_async(self):
+        """C20 0-active suspend selector (production dispatch path).
 
         F39 C20 MVP: when no candidate is available (post-shrink active set
         emptied to 0), suspend on ``_workers_changed`` until an
