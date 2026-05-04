@@ -204,7 +204,19 @@ class MilesRouter:
         body: bytes | None = None,
         headers: dict | None = None,
     ) -> dict:
-        """Core proxy logic. Returns dict with request_body, response_body, status_code, headers."""
+        """Core proxy logic. Returns dict with request_body, response_body, status_code, headers.
+
+        F32 router metadata injection: when ``path == "generate"``,
+        rewrite the JSON response body to inject
+        ``meta_info["miles_engine_index", "miles_admission_disabled"]``
+        based on the dispatched worker URL. The injection is path-guarded
+        (only ``/generate``) to avoid breaking
+        ``/model_info`` / ``/v1/loads`` / ``/health`` etc. Header
+        hardening: Content-Encoding is stripped because rewriting the
+        body invalidates any prior gzip / deflate content-coding;
+        Content-Length is recomputed by build_proxy_response /
+        JSONResponse so we drop it here as well.
+        """
         worker_url = await self._use_url_async()
         url = f"{worker_url}/{path}"
 
@@ -218,14 +230,62 @@ class MilesRouter:
         try:
             response = await self.client.request(request.method, url, content=body, headers=headers)
             content = await response.aread()
+            response_headers = dict(response.headers)
+            status_code = response.status_code
+
+            if path == "generate" and 200 <= status_code < 300:
+                content, response_headers = self._inject_generate_metadata(
+                    content, response_headers, worker_url
+                )
+
             return {
                 "request_body": body,
                 "response_body": content,
-                "status_code": response.status_code,
-                "headers": dict(response.headers),
+                "status_code": status_code,
+                "headers": response_headers,
             }
         finally:
             self._finish_url(worker_url)
+
+    def _inject_generate_metadata(
+        self, content: bytes, headers: dict, worker_url: str
+    ) -> tuple[bytes, dict]:
+        """Mutate the JSON body to add F32 router metadata (only /generate).
+
+        Reads ``enabled_workers`` at response time so that ``miles_admission_disabled``
+        reflects the current admission state (the worker may have been
+        disabled while the request was in flight — that is the F31
+        scheduler-preempt signal multi_turn redispatch consumes).
+
+        Strips ``Content-Encoding`` from the upstream response headers
+        because rewriting the body invalidates any prior content-coding
+        the client would have decoded.
+        """
+        try:
+            payload = json.loads(content)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return content, headers
+        # Only handle dict-shaped /generate responses; lists / other shapes
+        # bypass injection (some SGLang versions return arrays).
+        if not isinstance(payload, dict):
+            return content, headers
+        meta_info = payload.setdefault("meta_info", {})
+        if not isinstance(meta_info, dict):
+            # Some SGLang versions return meta_info=None on errors; promote.
+            meta_info = {}
+            payload["meta_info"] = meta_info
+        engine_index = self.worker_engine_index_map.get(worker_url)
+        if engine_index is not None:
+            meta_info["miles_engine_index"] = engine_index
+        meta_info["miles_worker_url"] = worker_url
+        meta_info["miles_admission_disabled"] = worker_url not in self.enabled_workers
+        # Strip Content-Encoding: the upstream may have gzipped the body, but
+        # we returned it through httpx.aread() which already decoded into
+        # bytes. Re-emitting the original content-coding header is wrong.
+        new_headers = {
+            k: v for k, v in headers.items() if k.lower() != "content-encoding"
+        }
+        return json.dumps(payload).encode("utf-8"), new_headers
 
     def build_proxy_response(self, result: dict) -> Response:
         """Build HTTP response from proxy result."""

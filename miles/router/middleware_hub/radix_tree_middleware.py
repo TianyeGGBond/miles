@@ -58,6 +58,22 @@ async def _materialize_response(resp):
 
 class RadixTreeMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, *, router):
+        # F103 / C17 — RLix mode disables RadixTreeMiddleware. The middleware
+        # bypasses the router's _use_url path so the F3 admission lifecycle
+        # cannot enforce scheduler-preempt classification, and the prefix-
+        # cache state would survive scheduler shrink/expand. Re-enabling
+        # under RLix mode requires a partial_rollout + radix_tree adapter
+        # (not in scope for any current milestone).
+        import os as _os  # local import — module top imports must change
+
+        if _os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+            raise RuntimeError(
+                "RadixTreeMiddleware is forbidden in RLix mode "
+                "(RLIX_CONTROL_PLANE=rlix). partial_rollout + radix_tree "
+                "compatibility is follow-up after the main RLix path "
+                "stabilizes; remove RadixTreeMiddleware from "
+                "args.miles_router_middleware_paths."
+            )
         super().__init__(app)
         self.router = router
         self.args = router.args
