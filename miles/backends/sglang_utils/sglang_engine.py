@@ -436,6 +436,100 @@ class SGLangEngine(RayActor):
             {"tags": tags},
         )
 
+    # ------------------------------------------------------------------
+    # F1 RLix-mode sleep/wake helpers (used by F2 RolloutManager.shrink_engines)
+    # ------------------------------------------------------------------
+
+    def is_idle(self, timeout_s: float = 5.0) -> bool:
+        """Return True iff the SGLang server has no in-flight or queued requests.
+
+        Reads ``GET /v1/loads`` and inspects ``slot["num_total_reqs"]`` (sum of
+        running + waiting). The plan explicitly forbids reading
+        ``/server_info``'s ``num_running_reqs`` field for this purpose because
+        it is missing the waiting-queue depth and is not present in all SGLang
+        versions.
+
+        Returns ``True`` when every slot reports ``num_total_reqs == 0``;
+        returns ``False`` if any slot is non-zero. Connection errors and
+        HTTP failures bubble up to the caller (used inside the abort-drain
+        loop, which has its own retry budget).
+        """
+        if self.node_rank != 0:
+            # Non-rank-0 nodes don't talk HTTP; defer to rank 0's verdict.
+            return True
+        url = f"http://{self.server_host}:{self.server_port}/v1/loads"
+        response = requests.get(url, timeout=timeout_s)
+        response.raise_for_status()
+        body = response.json()
+        slots = body.get("slots") if isinstance(body, dict) else None
+        if not isinstance(slots, list):
+            # Older SGLang shapes may put the list at the top level.
+            if isinstance(body, list):
+                slots = body
+            else:
+                raise RuntimeError(f"Unexpected /v1/loads payload shape: {body!r}")
+        for slot in slots:
+            if int(slot.get("num_total_reqs", 0)) != 0:
+                return False
+        return True
+
+    def abort_all_requests(self, timeout_s: float = 10.0) -> dict:
+        """POST ``/abort_request {"abort_all": true}`` to drain the engine.
+
+        Used by F2 abort-drain-sleep ordering: admission close →
+        ``_abort_engines`` → drain via ``is_idle`` →
+        ``release_memory_occupation`` → post-sleep VRAM assert. Returns the
+        SGLang JSON response so the caller can log the count of aborted reqs.
+        """
+        if self.node_rank != 0:
+            return {}
+        url = f"http://{self.server_host}:{self.server_port}/abort_request"
+        response = requests.post(url, json={"abort_all": True}, timeout=timeout_s)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return {"raw": response.text}
+
+    def assert_post_sleep_vram_below_threshold(
+        self, threshold_gb: float, timeout_s: float = 5.0
+    ) -> float:
+        """Anti-regression invariant #8 — verify post-sleep VRAM is below threshold.
+
+        Reads SGLang ``/server_info`` ``memory_usage`` (reported in GiB) after
+        ``release_memory_occupation`` / sleep and raises if the resident VRAM
+        exceeds ``threshold_gb``. This is the *server-side* assert (distinct
+        from the train-side ``torch.cuda.memory_allocated`` assert which is
+        Layer 3 / M11.5 follow-up). Returns the observed memory_usage value
+        in GiB so callers can log it.
+
+        Notes:
+        - ``threshold_gb`` is typically ``args.miles_post_sleep_vram_threshold_gb``
+          (default 1.0 GiB).
+        - On non-rank-0 nodes this is a no-op returning ``0.0``.
+        """
+        if self.node_rank != 0:
+            return 0.0
+        url = f"http://{self.server_host}:{self.server_port}/server_info"
+        response = requests.get(url, timeout=timeout_s)
+        response.raise_for_status()
+        body = response.json()
+        memory_usage_gb = body.get("memory_usage")
+        if memory_usage_gb is None:
+            raise RuntimeError(
+                "/server_info response missing 'memory_usage' field; cannot enforce "
+                "post-sleep VRAM threshold (Anti-regression invariant #8)"
+            )
+        memory_usage_gb = float(memory_usage_gb)
+        if memory_usage_gb > float(threshold_gb):
+            raise RuntimeError(
+                f"Post-sleep VRAM {memory_usage_gb:.3f} GiB exceeds threshold "
+                f"{float(threshold_gb):.3f} GiB on engine "
+                f"{self.server_host}:{self.server_port} — torch_memory_saver may "
+                f"have leaked. Check release_memory_occupation tags."
+            )
+        return memory_usage_gb
+
     def resume_memory_occupation(self, tags: list[str] = None):
         """
         Available tags for multi-stage resume: weights, kv_cache
