@@ -556,6 +556,158 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             destroy_process_groups()
 
+    # ------------------------------------------------------------------
+    # F4 sender-side API (RLix mode) — top-level Ray methods consumed by
+    # MilesModelUpdateService.run_sync_session via a single composite RPC
+    # in iter 12. This iter (11) lands the cache build + cache_owner role
+    # report only; the run_sync_session composite Ray method itself is
+    # iter 12's concern.
+    #
+    # F18 cache_owner uniqueness: exactly one rank reports
+    # is_cache_owner=True at init Step 6.5 (pp0 + dp0 + tp0 + cp0). Other
+    # ranks participate in the collective gather (so the cache_owner can
+    # produce HF-format weights) but discard the resulting tensors and
+    # advance their own _cache_ready_step pointer in lockstep.
+    # ------------------------------------------------------------------
+
+    def _ensure_cpu_bucket_cache(self):
+        """Lazily initialize the per-rank :class:`CPUBucketCache`.
+
+        Constructed once and reused across every training step's bucket
+        rebuild. Bucket size cap comes from
+        ``args.miles_model_update_bucket_size_mb`` (cf. F10 S2/S3a-2
+        startup checks).
+        """
+        if not hasattr(self, "_cpu_bucket_cache") or self._cpu_bucket_cache is None:
+            from .update_weight.cpu_bucket_cache import CPUBucketCache
+
+            max_bytes = int(getattr(self.args, "miles_model_update_bucket_size_mb", 512)) * 1024 * 1024
+            self._cpu_bucket_cache = CPUBucketCache(max_bucket_size_bytes=max_bytes)
+            # F20: bucket build / sync session each acquire this lock for
+            # the whole critical section (single-method-single-critical-
+            # section). Cross-RPC locking is forbidden (Layer 1 / F04).
+            import threading as _threading
+
+            self._cache_lock = _threading.Lock()
+        return self._cpu_bucket_cache
+
+    @staticmethod
+    def _is_cache_owner_rank() -> bool:
+        """F18: exactly one rank returns True (pp0 + dp0 + tp0 + cp0).
+
+        Mirrors the existing
+        ``UpdateWeightFromTensor._is_distributed_src_rank`` predicate so
+        the cache_owner agrees with the existing weight-update sender
+        rank. cp_rank == 0 is implicit when cp_size == 1; the
+        intra_dp_cp.rank predicate already covers it for cp_size > 1.
+        """
+        from megatron.core import parallel_state as mpu
+
+        from .update_weight.common import get_parallel_state
+
+        return (
+            get_parallel_state().intra_dp_cp.rank == 0
+            and mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == 0
+        )
+
+    def report_cache_owner_role(self) -> tuple[int, bool]:
+        """Top-level Ray method — return (rank, is_cache_owner) for this rank.
+
+        Called once at init Step 6.5 by ``RayTrainGroup.collect_cache_owner_roles``
+        (iter 15) so the orchestrator can construct the cache_owner-actor
+        handle pair the :class:`MilesModelUpdateService` needs.
+        """
+        return int(dist.get_rank()), bool(self._is_cache_owner_rank())
+
+    def build_cpu_bucket_cache(self, step: int) -> int:
+        """F4 build: gather HF-format weights into CPU buckets for `step`.
+
+        Every rank participates in the implicit collective gather inside
+        ``named_params_and_buffers`` (it broadcasts/all-gathers across TP
+        / PP). Only the cache_owner stores the resulting tensors; other
+        ranks call ``put_empty_step`` so their ``_cache_ready_step``
+        pointer matches.
+
+        ``step == -1`` is the init bootstrap path (base from-checkpoint
+        weights); ``step >= 0`` is a post-training-step refresh.
+
+        Returns the published step (echoed for caller logging).
+        """
+        from .update_weight.common import named_params_and_buffers
+        from .update_weight.cpu_bucket_cache import BucketEntry
+
+        cache = self._ensure_cpu_bucket_cache()
+        is_owner = self._is_cache_owner_rank()
+
+        # Collective: every rank must participate even when not the owner.
+        named = named_params_and_buffers(
+            self.args,
+            self.model,
+            convert_to_global_name=True,
+            translate_gpu_to_cpu=True,
+        )
+        # Materialize as a list to ensure the generator (if any) is consumed
+        # before the lock is acquired.
+        named_list = list(named) if named is not None else []
+
+        with self._cache_lock:
+            if not is_owner:
+                # Non-owner ranks discard the gathered tensors but advance
+                # their pointer so upstream readiness checks see lockstep.
+                cache.put_empty_step(int(step))
+                return int(step)
+
+            # F4 bucket layout: pack (name, tensor) pairs into buckets up
+            # to max_bucket_size_bytes each. Tensors are HF-format and
+            # already on CPU (translate_gpu_to_cpu=True above); they may
+            # be pinned-host or paged depending on the upstream
+            # named_params_and_buffers implementation.
+            max_bytes = cache.max_bucket_size_bytes
+            buckets: list[BucketEntry] = []
+            current: dict[str, torch.Tensor] = {}
+            current_bytes = 0
+            current_elements = 0
+            current_idx = 0
+            for name, tensor in named_list:
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                # Defensive: HF-format tensors ought to be on CPU after
+                # translate_gpu_to_cpu=True, but legacy paths may return
+                # CUDA tensors. Move to CPU rather than fail; the
+                # BucketEntry __post_init__ would otherwise reject it.
+                if tensor.is_cuda:
+                    tensor = tensor.detach().to("cpu")
+                tensor_bytes = tensor.element_size() * tensor.numel()
+                if current_bytes + tensor_bytes > max_bytes and current:
+                    buckets.append(
+                        BucketEntry(
+                            bucket_index=current_idx,
+                            params=current,
+                            size_bytes=current_bytes,
+                            element_count=current_elements,
+                        )
+                    )
+                    current_idx += 1
+                    current = {}
+                    current_bytes = 0
+                    current_elements = 0
+                current[name] = tensor
+                current_bytes += tensor_bytes
+                current_elements += tensor.numel()
+            if current:
+                buckets.append(
+                    BucketEntry(
+                        bucket_index=current_idx,
+                        params=current,
+                        size_bytes=current_bytes,
+                        element_count=current_elements,
+                    )
+                )
+
+            cache.put_step(int(step), buckets)
+        return int(step)
+
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         self.args.load = path
