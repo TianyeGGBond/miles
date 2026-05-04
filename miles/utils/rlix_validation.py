@@ -63,13 +63,20 @@ def _infer_devices(args: Any) -> set[int]:
 
 
 def train_devices_subset_of_infer(args: Any) -> bool:
-    """F11 helper: detect a partial-overlap topology without spinning up a coord.
+    """RLix-mode helper: detect partial-overlap topology from zero-based indices.
 
-    Returns True iff ``train_devices`` is a strict (proper) subset of
-    ``infer_devices``. The standalone entry ``train_async.py`` rejects this
-    config when ``RLIX_CONTROL_PLANE`` is unset — running it through the
-    standalone full-broadcast path would put train and infer on the same GPU
-    and silent-OOM at infer wake_up.
+    Returns True iff zero-based ``train_devices`` is a strict (proper) subset of
+    zero-based ``infer_devices``. **Only meaningful in RLix mode**, where the
+    scheduler shares a single zero-based index space across train + infer pools.
+
+    NOT a safe predicate for the standalone (``train_async.py``) path:
+    ``create_placement_groups`` allocates rollout bundles at offset
+    ``actor_num_nodes * actor_num_gpus_per_node``, so a standalone non-colocated
+    config such as 4 actor GPUs + ``--rollout-num-gpus 8`` is fully disjoint
+    even though the zero-based sets overlap. The standalone fail-fast in
+    ``train_async.py`` therefore relies only on the ``RLIX_CONTROL_PLANE``
+    env-var check; partial-overlap detection happens at the RLix entry driver
+    via :func:`assert_rlix_topology` (C1).
     """
     train = _train_devices(args)
     infer = _infer_devices(args)
@@ -357,22 +364,21 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
 
 
 def assert_partial_overlap_standalone_safe(args: Any) -> None:
-    """F11 helper for ``train_async.py`` — refuse partial overlap without RLix.
+    """Deprecated no-op kept for callsite stability.
 
-    This function fires only when ``RLIX_CONTROL_PLANE`` is unset. The
-    caller should invoke it before any heavy import path that depends on the
-    standalone weight-update broadcast.
+    Originally intended to refuse partial-overlap topologies under the
+    standalone entry. Removed because the standalone ``create_placement_groups``
+    path offsets the rollout pool by ``actor_num_nodes * actor_num_gpus_per_node``,
+    so zero-based ``train ⊂ infer`` is also true for valid disjoint
+    standalone configs (e.g. 4 actor GPUs + ``--rollout-num-gpus 8``).
+    Auto-classifying intent from args alone is unsafe; the env-var guard
+    (``RLIX_CONTROL_PLANE=rlix``) is the only reliable signal at the standalone
+    entry. RLix-mode partial-overlap correctness is enforced by
+    :func:`assert_rlix_topology` (C1) inside the RLix entry driver.
     """
-    if is_rlix_mode():
-        return
-    if train_devices_subset_of_infer(args):
-        raise RuntimeError(
-            "Partial-overlap topology detected (train_devices ⊂ infer_devices) "
-            "without RLIX_CONTROL_PLANE=rlix. The standalone "
-            "RolloutManager.update_weights_from_distributed full-broadcast path "
-            "would contend on overlap GPUs → silent OOM at infer wake_up. "
-            "Use examples/rlix/run_miles_rlix.py for partial-overlap configs."
-        )
+    # Intentional no-op — see docstring.
+    del args
+    return None
 
 
 __all__ = [

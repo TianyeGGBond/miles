@@ -6,32 +6,34 @@ from miles.utils.arguments import parse_args
 from miles.utils.async_utils import eager_create_task
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import should_run_periodic_action
-from miles.utils.rlix_validation import assert_partial_overlap_standalone_safe
 from miles.utils.tracking_utils import init_tracking
 
 
 def _assert_standalone_entry(args) -> None:
-    """F11 standalone fail-fast — refuse to run under RLix or with partial overlap.
+    """F11 standalone fail-fast — refuse to run via this entry under RLix mode.
 
-    The RLix entry driver is ``examples/rlix/run_miles_rlix.py``. Standalone code
-    path (this file) MUST NOT be reached when ``RLIX_CONTROL_PLANE=rlix`` is set;
-    doing so would silently bypass scheduler-managed sleep/wake and degrade to
-    full-broadcast weight sync.
+    The RLix entry driver is ``examples/rlix/run_miles_rlix.py``. Standalone
+    code path (this file) MUST NOT be reached when ``RLIX_CONTROL_PLANE=rlix``
+    is set; doing so would silently bypass scheduler-managed sleep/wake and
+    degrade to full-broadcast weight sync.
 
-    Also refuses partial-overlap configs (``train_devices ⊂ infer_devices``) when
-    not in RLix mode — those require C20 router admission + cache-owner sync,
-    neither of which standalone has. Standalone non-colocated configs with a
-    *disjoint* rollout pool (e.g. 8 actor GPUs + ``--rollout-num-gpus 4``,
-    12 disjoint total) are unaffected: the helper only fires when train indices
-    are a strict subset of infer indices.
+    Note: classifying partial-overlap topologies from args alone is unsafe at
+    the standalone entry because ``create_placement_groups`` offsets the
+    rollout pool from the actor pool, so zero-based ``train ⊂ infer`` is also
+    true for valid disjoint configs (e.g. 4 actor GPUs +
+    ``--rollout-num-gpus 8``). The env-var guard below is therefore the only
+    standalone-side gate; RLix-mode topology correctness is enforced by
+    ``miles.utils.rlix_validation.assert_rlix_topology`` (C1) inside the RLix
+    entry driver.
     """
+    del args  # unused; kept for signature stability if future args-based
+              # checks are added that don't mis-fire on standalone configs.
     if os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
         raise RuntimeError(
             "RLIX_CONTROL_PLANE=rlix is set but train_async.py is the standalone "
             "entry. Use `examples/rlix/run_miles_rlix.py` for RLix-managed "
             "scheduling, or unset RLIX_CONTROL_PLANE to run standalone."
         )
-    assert_partial_overlap_standalone_safe(args)
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
