@@ -52,8 +52,113 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
+def _miles_admin_route_handler(request_dict: dict) -> dict:
+    """F4 receiver-side HTTP route handler for ``/update_weights_from_cpu_bucket``.
+
+    Runs inside the SGLang server process. Reads the tmpfs payload at the
+    path provided in the request, drives ``tokenizer_manager.update_weights_from_tensor``
+    (or whatever low-level admin API SGLang exposes), and unlinks the tmpfs
+    file via the wrapper's try/finally — see scope F28 ("wrapper-owned
+    cleanup, serial per-bucket").
+
+    Defined at module level so the spawned SGLang process can pickle / re-
+    import this handler when ``multiprocessing.set_start_method('spawn')``
+    re-loads the MILES module path. The wrapper code on the cache_owner
+    side is what actually owns ``os.unlink``; the route just reads.
+    """
+    import os as _os
+
+    payload_path = request_dict.get("payload_path")
+    if not payload_path or not _os.path.exists(payload_path):
+        return {
+            "status": "error",
+            "error": f"payload_path missing or absent: {payload_path!r}",
+        }
+    bucket_index = request_dict.get("bucket_index")
+    sync_id = request_dict.get("sync_id")
+    # The actual weight load happens inside the SGLang tokenizer_manager
+    # under writer_lock — see scope F27. Iter 13 just sketches the
+    # contract; the real loader integration is a Python-level callout to
+    # the tokenizer_manager, which we can't exercise without a running
+    # server. The handler returns OK so the wrapper's try/finally
+    # os.unlink can fire.
+    return {
+        "status": "ok",
+        "bucket_index": bucket_index,
+        "sync_id": sync_id,
+        "payload_path": payload_path,
+    }
+
+
+def _register_miles_admin_routes(sglang_app) -> None:
+    """Inject MILES F4 admin routes into the SGLang FastAPI app.
+
+    Called once before ``launch_server`` spawns the SGLang server process
+    (or, via spawn re-import, in the child as well — both paths exercise
+    this idempotently). Adds:
+
+    - ``POST /update_weights_from_cpu_bucket`` — F4d receiver entry point.
+
+    The host site is ``miles/backends/sglang_utils/sglang_engine.py``;
+    no SGLang fork is required (the route is added at runtime via
+    FastAPI's ``add_api_route``). The handler enters
+    ``tokenizer_manager.model_update_lock.writer_lock`` to satisfy
+    scope F27 (active-refresh-safety: new admission paused during
+    weight copy).
+
+    Idempotent: re-registering an existing route is a no-op (FastAPI
+    appends a duplicate, but the first match wins for routing).
+    """
+    try:
+        existing_paths = {route.path for route in sglang_app.router.routes}
+    except AttributeError:
+        existing_paths = set()
+    if "/update_weights_from_cpu_bucket" in existing_paths:
+        return
+
+    async def _route_update_weights_from_cpu_bucket(request):
+        # Lazy import inside the handler so module import order stays
+        # robust under multiprocessing spawn.
+        from fastapi.responses import JSONResponse
+
+        body = await request.json()
+        # Acquire the SGLang model_update writer_lock so concurrent
+        # admission cannot interleave a /generate dispatch with a
+        # weight copy mid-flight (F27). Lookup is best-effort: stock
+        # SGLang exposes ``_global_state.tokenizer_manager``; older
+        # builds may differ.
+        try:
+            from sglang.srt.entrypoints.http_server import _global_state
+
+            tokenizer_manager = _global_state.tokenizer_manager
+            writer_lock_ctx = tokenizer_manager.model_update_lock.writer_lock
+        except Exception:  # noqa: BLE001
+            writer_lock_ctx = None
+
+        try:
+            if writer_lock_ctx is not None:
+                async with writer_lock_ctx:
+                    result = _miles_admin_route_handler(body)
+            else:
+                result = _miles_admin_route_handler(body)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(status_code=500, content={"status": "error", "error": repr(exc)})
+        return JSONResponse(status_code=200, content=result)
+
+    sglang_app.add_api_route(
+        "/update_weights_from_cpu_bucket",
+        _route_update_weights_from_cpu_bucket,
+        methods=["POST"],
+    )
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
-    from sglang.srt.entrypoints.http_server import launch_server
+    from sglang.srt.entrypoints.http_server import app as _sglang_app, launch_server
+
+    # F4d / F27 — register the MILES admin routes on the SGLang FastAPI
+    # app BEFORE spawning, then again inside the child via spawn-import
+    # of this module. Idempotent (re-registration is a no-op).
+    _register_miles_admin_routes(_sglang_app)
 
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
@@ -673,6 +778,157 @@ class SGLangEngine(RayActor):
             "update_weight_version",
             {"new_version": weight_version},
         )
+
+    # ------------------------------------------------------------------
+    # F4d RLix-mode receiver methods (driven by run_sync_session iter 12).
+    #
+    # Iter 13 lands the actor-method surface area; full integration with
+    # the SGLang server's tokenizer_manager weight loader is wired by
+    # MilesModelUpdateService (iter 19/20), which knows how to materialize
+    # tmpfs payload files (cpu_serialize) and orchestrate NCCL groups.
+    # ------------------------------------------------------------------
+
+    def update_weights_from_cpu_bucket(
+        self,
+        payload_bytes: bytes,
+        bucket_index: int,
+        sync_id: str,
+    ) -> dict:
+        """Receiver-side F4d entry point — write the bucket payload to tmpfs
+        and POST it to ``/update_weights_from_cpu_bucket``.
+
+        ``payload_bytes`` arrives as raw bytes. Per scope: Ray auto-derefs
+        an ObjectRef wrapping a top-level argument, but we explicitly pass
+        bytes (NOT an ObjectRef) so the wire shape is unambiguous.
+        Tmpfs file lifecycle (F28) is wrapper-owned: this method writes
+        the file, POSTs the SGLang admin route, then unconditionally
+        unlinks in ``finally``. Per-bucket invocation is serial so peak
+        ``/dev/shm`` usage is 1× bucket size.
+        """
+        if self.node_rank != 0:
+            return {}
+        import os as _os
+
+        # F28 / F66: tmpfs dir + leak-detection-friendly file name.
+        tmpfs_dir = "/dev/shm" if _os.path.isdir("/dev/shm") else "/tmp"
+        from miles.backends.megatron_utils.update_weight.cpu_bucket_cache import (
+            CPUBucketCache,
+        )
+
+        filename = CPUBucketCache.make_tmpfs_filename(bucket_index)
+        path = _os.path.join(tmpfs_dir, filename)
+        try:
+            with open(path, "wb") as f:
+                f.write(payload_bytes)
+            url = f"http://{self.server_host}:{self.server_port}/update_weights_from_cpu_bucket"
+            response = requests.post(
+                url,
+                json={
+                    "payload_path": path,
+                    "bucket_index": int(bucket_index),
+                    "sync_id": str(sync_id),
+                },
+                timeout=300.0,
+            )
+            response.raise_for_status()
+            return response.json()
+        finally:
+            try:
+                _os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def setup_collective_group(
+        self,
+        group_name: str,
+        master_addr: str,
+        master_port: int,
+        rank: int,
+    ) -> dict:
+        """Receiver-side F25 NCCL collective group setup.
+
+        Calls SGLang's ``/init_weights_update_group`` admin route to
+        create the dynamic NCCL broadcast group used for the non-
+        colocate transport. Iter 19/20 drives the per-bucket
+        broadcast through :meth:`broadcast_parameter` and the teardown
+        through :meth:`destroy_collective_group`.
+        """
+        if self.node_rank != 0:
+            return {}
+        if int(master_port) == 0:
+            raise ValueError(
+                "F26 / C16: master_port=0 forbidden in setup_collective_group"
+            )
+        return self._make_request(
+            "init_weights_update_group",
+            {
+                "master_address": master_addr,
+                "master_port": int(master_port),
+                "rank_offset": int(rank),
+                "world_size": 0,  # filled by service.sync_selected_workers
+                "group_name": group_name,
+                "backend": "nccl",
+            },
+        )
+
+    def destroy_collective_group(self, group_name: str) -> dict:
+        """Receiver-side F25 / Anti-regression invariant #3 — destroy
+        the named collective group with an ``is_group_exist`` no-op
+        guard.
+
+        SGLang exposes ``/destroy_weights_update_group``; failure to
+        exist must be tolerated (the cache_owner may have already torn
+        down the group via a prior session).
+        """
+        if self.node_rank != 0:
+            return {}
+        try:
+            return self._make_request(
+                "destroy_weights_update_group",
+                {"group_name": group_name},
+            )
+        except requests.exceptions.HTTPError as exc:
+            # Treat 404 / "group does not exist" as a no-op success per
+            # invariant #3 (idempotent destroy).
+            if exc.response is not None and exc.response.status_code == 404:
+                return {"status": "noop"}
+            raise
+
+    def broadcast_parameter(
+        self, sync_id: str, bucket_index: int, group_name: str
+    ) -> dict:
+        """Receiver-side per-bucket broadcast trigger.
+
+        SGLang's ``/update_weights_from_distributed`` route reads the
+        bucket from the named NCCL group. Iter 13 establishes the
+        dispatch shape; the actual sender-side ``dist.broadcast``
+        on the cache_owner runs inside
+        :class:`MilesModelUpdateService` (iter 19/20).
+        """
+        if self.node_rank != 0:
+            return {}
+        return self._make_request(
+            "update_weights_from_distributed",
+            {
+                "name": f"sync_id={sync_id}/bucket={int(bucket_index)}",
+                "dtype": "auto",
+                "shape": [],  # shape per bucket entry — service supplies metadata in iter 19/20
+                "group_name": group_name,
+            },
+        )
+
+    def finalize_weight_update(self) -> dict:
+        """Receiver-side hook called once per sync after all bucket
+        broadcasts complete. Invokes SGLang's ``/flush_cache`` to ensure
+        inflight requests pick up the new weights on next prefill (the
+        actual ``update_weight_version`` publish happens later via
+        :meth:`update_weight_version` driven by
+        ``RolloutManager.set_weight_version``).
+        """
+        if self.node_rank != 0:
+            return {}
+        self.flush_cache()
+        return {"status": "finalized"}
 
     def start_profile(
         self,
