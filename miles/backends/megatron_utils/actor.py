@@ -790,6 +790,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "cpu_serialize_local_ranks",
             "broadcast_local_ranks",
             "comm_ranks",
+            "world_size",
         )
         missing = [k for k in required if k not in plan]
         if missing:
@@ -810,6 +811,7 @@ class MegatronTrainRayActor(TrainRayActor):
         cpu_serialize_local_ranks: set[int] = set(plan["cpu_serialize_local_ranks"])
         broadcast_local_ranks: set[int] = set(plan["broadcast_local_ranks"])
         comm_ranks: dict[int, int] = dict(plan["comm_ranks"])
+        world_size: int = int(plan["world_size"])
 
         cache = self._ensure_cpu_bucket_cache()
         with self._cache_lock:
@@ -860,6 +862,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     master_addr=master_addr,
                     master_port=master_port,
                     comm_ranks=comm_ranks,
+                    world_size=world_size,
                 )
 
         return version
@@ -910,22 +913,30 @@ class MegatronTrainRayActor(TrainRayActor):
         master_addr: str,
         master_port: int,
         comm_ranks: dict[int, int],
+        world_size: int,
     ) -> None:
         """In-method helper: dynamic NCCL broadcast of bucket payloads.
 
         Iter 12 establishes the dispatch shape (group setup, per-bucket
-        broadcast loop, group destroy). The actual collective-group
-        wiring (sender-side init_process_group + per-bucket dist.broadcast
-        + dist.destroy_process_group) and the receiver-side
-        setup/destroy_collective_group + broadcast_parameter Ray methods
-        land alongside iter 13. For now, ask each engine to set up its
-        side of the group and tear it down at the end.
+        broadcast loop, group destroy). The actual sender-side
+        ``init_process_group`` + per-bucket ``dist.broadcast`` +
+        ``dist.destroy_process_group`` is driven by
+        :class:`MilesModelUpdateService` (iter 19/20). For now, ask each
+        receiver engine to set up its side of the group, fan out
+        per-bucket ``broadcast_parameter`` with the HF-format metadata
+        SGLang's ``/update_weights_from_distributed`` route requires,
+        and tear the group down in ``finally`` (Anti-regression
+        invariant #3 idempotent destroy).
         """
         if not target_handles:
             return
-        # Receiver-side group create. SGLangEngine helpers land in iter
-        # 13; calling .remote() here is the contract shape and will
-        # exercise once iter 13 lands.
+        if world_size <= 0:
+            raise ValueError(
+                f"_dispatch_nccl_broadcast requires world_size > 0; got {world_size}"
+            )
+        # Receiver-side group create with the same world_size value the
+        # sender uses (cache_owner == rank 0, plus one entry per
+        # receiver engine that participates in the broadcast).
         ray.get(
             [
                 handle.setup_collective_group.remote(
@@ -933,18 +944,31 @@ class MegatronTrainRayActor(TrainRayActor):
                     master_addr=master_addr,
                     master_port=master_port,
                     rank=comm_ranks[engine_index],
+                    world_size=int(world_size),
                 )
                 for engine_index, handle in target_handles.items()
             ]
         )
         try:
             for bucket in buckets:
+                # Per-bucket metadata for SGLang's
+                # update_weights_from_distributed admin route.
+                names: list[str] = []
+                dtypes: list[str] = []
+                shapes: list[list[int]] = []
+                for name, tensor in bucket.params.items():
+                    names.append(name)
+                    dtypes.append(str(tensor.dtype).replace("torch.", ""))
+                    shapes.append(list(tensor.shape))
                 ray.get(
                     [
                         handle.broadcast_parameter.remote(
                             sync_id=sync_id,
                             bucket_index=int(bucket.bucket_index),
                             group_name=group_name,
+                            names=names,
+                            dtypes=dtypes,
+                            shapes=shapes,
                         )
                         for handle in target_handles.values()
                     ]
