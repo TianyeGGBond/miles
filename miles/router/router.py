@@ -38,6 +38,15 @@ class MilesRouter:
         self.app = FastAPI()
         self.app.router.on_startup.append(self._start_background_health_check)
 
+        # F39 C20 0-active suspend (M11.2 happy-path code surface):
+        #   _workers_changed gates dispatch when (enabled_workers -
+        #   dead_workers) is empty. _use_url awaits this Condition's predicate
+        #   "any candidate available" without a timeout; every state-mutating
+        #   admin endpoint must `notify_all` after the helper updates the
+        #   registry. Forbidden hardening (bounded timeout + 503 sentinel +
+        #   client EnginePreemptedError translation) is M11.5 (F79).
+        self._workers_changed: asyncio.Condition = asyncio.Condition()
+
         # F3 admission lifecycle (scope F39 / F14):
         #   - worker_request_counts: URL → in-flight count (also doubles as the
         #     "registered" set; presence in this dict ⇔ the worker has been
@@ -136,12 +145,17 @@ class MilesRouter:
 
                 results = await asyncio.gather(*(self._check_worker_health(url) for url in urls))
 
+                # F39 C20: detect dead/recovered transitions so the dispatch
+                # condition can be notified once we're done updating state.
+                transitioned = False
                 for url, is_healthy in results:
                     if not is_healthy:
                         failures = self.worker_failure_counts.get(url, 0) + 1
                         self.worker_failure_counts[url] = failures
 
                         if failures >= threshold:
+                            if url not in self.dead_workers:
+                                transitioned = True
                             logger.warning(
                                 f"[miles-router] Worker {url} failed {threshold} consecutive health checks. Marking as DEAD."
                             )
@@ -150,7 +164,14 @@ class MilesRouter:
                             # model versions to avoid off-policy issues from stale weights, since these
                             # dead workers' parameters may not be refitted.
                     else:
+                        was_dead = url in self.dead_workers
                         self.worker_failure_counts[url] = 0
+                        if was_dead:
+                            transitioned = True
+                            self.dead_workers.discard(url)
+
+                if transitioned:
+                    await self._notify_workers_changed()
 
                 logger.debug(
                     f"[miles-router] Health check complete. {len(self.worker_request_counts) - len(self.dead_workers)} workers healthy."
@@ -176,7 +197,7 @@ class MilesRouter:
         headers: dict | None = None,
     ) -> dict:
         """Core proxy logic. Returns dict with request_body, response_body, status_code, headers."""
-        worker_url = self._use_url()
+        worker_url = await self._use_url()
         url = f"{worker_url}/{path}"
 
         if body is None:
@@ -227,6 +248,7 @@ class MilesRouter:
                 status_code=400, content={"error": "worker_url is required (use query ?url=... or JSON body)"}
             )
         self._add_worker_internal(worker_url, engine_index)
+        await self._notify_workers_changed()
         return {"status": "success", "worker_urls": self.worker_request_counts}
 
     async def disable_worker(self, request: Request):
@@ -243,6 +265,7 @@ class MilesRouter:
         if not worker_url:
             return JSONResponse(status_code=400, content={"error": "worker_url is required"})
         self._disable_worker_internal(worker_url)
+        await self._notify_workers_changed()
         return {"status": "success", "enabled_workers": sorted(self.enabled_workers)}
 
     async def enable_worker(self, request: Request):
@@ -257,6 +280,7 @@ class MilesRouter:
         if not worker_url:
             return JSONResponse(status_code=400, content={"error": "worker_url is required"})
         self._enable_worker_internal(worker_url)
+        await self._notify_workers_changed()
         return {"status": "success", "enabled_workers": sorted(self.enabled_workers)}
 
     async def remove_worker(self, request: Request):
@@ -273,6 +297,7 @@ class MilesRouter:
         if not worker_url:
             return JSONResponse(status_code=400, content={"error": "worker_url is required"})
         self._remove_worker_internal(worker_url)
+        await self._notify_workers_changed()
         return {"status": "success", "worker_urls": sorted(self.worker_request_counts)}
 
     async def list_workers(self, request: Request):
@@ -358,35 +383,46 @@ class MilesRouter:
         if self.verbose:
             print(f"[miles-router] Enabled worker: {url}")
 
-    def _use_url(self):
-        """Select an admitted worker URL with minimal active requests.
-
-        Source of truth for dispatch is ``enabled_workers - dead_workers``
-        (per F39 critical invariant — NOT just worker_request_counts
-        membership). Iter 7 wraps this in an asyncio.Condition for the
-        C20 0-active suspend; iter 6 keeps the pre-C20 sync raise so
-        existing standalone behavior is unchanged.
-
-        Backward-compat fallback: tests and legacy callers populate
-        ``worker_request_counts`` directly without going through
-        ``add_worker``, so ``enabled_workers`` stays empty in that
-        scenario. When no admission has been declared at all (i.e.
-        ``enabled_workers`` is empty), fall back to treating every
-        registered worker as admitted. Once ``add_worker`` /
-        ``disable_worker`` has been used at least once,
-        ``enabled_workers`` becomes the strict source of truth and the
-        fallback is bypassed.
+    def _candidate_set(self) -> set[str]:
+        """Return the routable URL set used by both _use_url and the health
+        loop. Honors enabled_workers when admission has been declared, or
+        falls back to the full registry for legacy / test callers.
         """
         if self.enabled_workers:
-            candidates = self.enabled_workers - self.dead_workers
-        else:
-            # Legacy / test compat path.
-            candidates = set(self.worker_request_counts) - self.dead_workers
-        if not candidates:
-            raise RuntimeError("No enabled live workers available in the pool")
-        url = min(candidates, key=lambda u: self.worker_request_counts.get(u, 0))
-        self.worker_request_counts[url] += 1
-        return url
+            return self.enabled_workers - self.dead_workers
+        return set(self.worker_request_counts) - self.dead_workers
+
+    async def _use_url(self):
+        """Select an admitted worker URL with minimal active requests.
+
+        F39 C20 MVP: when no candidate is available (post-shrink active set
+        emptied to 0), suspend on ``_workers_changed`` until an
+        ``add_worker`` / ``enable_worker`` / health-recovered notify wakes
+        us. The wait is unbounded by design (per scope §F39 — bounded
+        production timeout + 503 sentinel + client EnginePreemptedError
+        translation are M11.5 follow-up).
+
+        The ``worker_request_counts[url] += 1`` increment MUST stay INSIDE
+        the condition lock so concurrent suspend / resume races with
+        ``_finish_url`` cannot drive the count negative (per F06 invariant).
+        """
+        async with self._workers_changed:
+            await self._workers_changed.wait_for(lambda: bool(self._candidate_set()))
+            candidates = self._candidate_set()
+            url = min(candidates, key=lambda u: self.worker_request_counts.get(u, 0))
+            self.worker_request_counts[url] += 1
+            return url
+
+    async def _notify_workers_changed(self) -> None:
+        """Wake every dispatcher suspended in :meth:`_use_url`.
+
+        Called by every state-mutating admin endpoint (add / enable /
+        disable / remove) after the sync internal helper has updated the
+        registry, and by the health-check loop on dead/recovered
+        transitions. Helpers themselves stay sync (per F14).
+        """
+        async with self._workers_changed:
+            self._workers_changed.notify_all()
 
     def _finish_url(self, url):
         """Mark the request to the given URL as finished"""
