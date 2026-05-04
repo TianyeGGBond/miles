@@ -27,7 +27,20 @@ def get_local_gpu_id():
 
 
 class TrainRayActor(RayActor):
-    def __init__(self, world_size, rank, master_addr, master_port):
+    def __init__(self, world_size, rank, master_addr, master_port, *, local_rank: int | None = None):
+        """Initialize the actor's distributed context.
+
+        ``local_rank`` is an optional explicit override (F34 / Fix #9).
+        Standalone path passes ``local_rank=None`` and falls back to
+        :func:`get_local_gpu_id`. RLix path (RayTrainGroup
+        ``worker_placements`` constructor, iter 15) passes
+        ``local_rank=0`` because each actor is allocated a fractional
+        ``num_gpus`` with a manual CVD: ``ray.get_gpu_ids()`` is NOT
+        in the manual CVD list under
+        ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1``, so
+        :func:`get_local_gpu_id` would ValueError or set the wrong
+        LOCAL_RANK.
+        """
         configure_logger()
 
         self._world_size = world_size
@@ -43,10 +56,13 @@ class TrainRayActor(RayActor):
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
-        # TODO: currently this doesn't work as ray has already set torch.cuda.device_count().
-        # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
-        os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
+        # F34 Fix #9: explicit local_rank wins; otherwise fall back to
+        # the legacy get_local_gpu_id() path which only works when
+        # CUDA_VISIBLE_DEVICES is the Ray-managed value.
+        if local_rank is not None:
+            os.environ["LOCAL_RANK"] = str(int(local_rank))
+        else:
+            os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
 
     def init(self, args, role, with_ref=False):
         self.args = args
