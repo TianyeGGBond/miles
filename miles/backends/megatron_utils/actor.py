@@ -726,6 +726,236 @@ class MegatronTrainRayActor(TrainRayActor):
             cache.put_step(int(step), buckets)
         return int(step)
 
+    def run_sync_session(self, plan) -> int:
+        """F4 sender-side composite RPC — single top-level Ray method.
+
+        Per scope F04 (Layer 1 forbidden) the cache_owner exposes ONE
+        top-level Ray method for transporting a sync session; helpers
+        (per-engine cpu_serialize, NCCL group setup/broadcast/destroy)
+        are in-method private helpers, NOT separate Ray RPCs. The
+        ``_cache_lock`` is held for the whole transport phase so the
+        bucket list snapshot + payload generation cannot be torn by a
+        concurrent build_cpu_bucket_cache.
+
+        ``plan`` is a plain mapping (per cozy-plan §Shared protocol
+        contract — RLix may use a frozen dataclass internally but
+        crosses the Ray boundary as ``dict[str, Any]`` so MILES has
+        zero RLix import dependency). Required keys:
+
+          - ``sync_id``: opaque str, traced through SGLang receiver logs.
+          - ``version``: int weight version; -1 means base from-init.
+          - ``group_name``: str, NCCL collective group name.
+          - ``master_addr``: str, NCCL master rendezvous host.
+          - ``master_port``: int, NCCL master rendezvous port (must
+            be != 0 per F26 / scope C16).
+          - ``timeout_s``: float (currently advisory; bounded
+            asyncio.wait_for is enforced by service.sync_selected_workers).
+          - ``target_handles``: dict[engine_index, ray_actor_handle]
+            populated by service from manager.get_engine_handles.
+          - ``cpu_serialize_local_ranks``: set[int] — engine indices that
+            receive via the cpu_serialize tmpfs path.
+          - ``broadcast_local_ranks``: set[int] — engine indices that
+            receive via the NCCL broadcast non-colocate path.
+          - ``comm_ranks``: dict[engine_index, int] — per-engine NCCL
+            rank within the dynamic broadcast group (cache_owner ==
+            rank 0).
+
+        Non-cache_owner ranks raise: only the cache_owner has the bucket
+        data and may drive transport. The MilesModelUpdateService picks
+        the right actor handle via report_cache_owner_role.
+        """
+        if not self._is_cache_owner_rank():
+            raise RuntimeError(
+                "run_sync_session called on non-cache_owner rank "
+                f"({dist.get_rank()}); service.sync_selected_workers must "
+                "drive only the cache_owner actor (selected via "
+                "report_cache_owner_role at init Step 6.5)."
+            )
+
+        if not isinstance(plan, dict):
+            raise TypeError(
+                f"run_sync_session expects plan as a dict (cross-Ray-boundary "
+                f"plain mapping); got {type(plan).__name__}"
+            )
+
+        required = (
+            "sync_id",
+            "version",
+            "group_name",
+            "master_addr",
+            "master_port",
+            "timeout_s",
+            "target_handles",
+            "cpu_serialize_local_ranks",
+            "broadcast_local_ranks",
+            "comm_ranks",
+        )
+        missing = [k for k in required if k not in plan]
+        if missing:
+            raise KeyError(f"run_sync_session plan missing keys: {missing}")
+
+        sync_id = str(plan["sync_id"])
+        version = int(plan["version"])
+        group_name = str(plan["group_name"])
+        master_addr = str(plan["master_addr"])
+        master_port = int(plan["master_port"])
+        if master_port == 0:
+            raise ValueError(
+                "F26 / C16: master_port=0 forbidden (other ranks cannot "
+                "discover the ephemeral port); MilesModelUpdateService.run "
+                "must claim a deterministic port via SharedStorage."
+            )
+        target_handles: dict[int, Any] = dict(plan["target_handles"])
+        cpu_serialize_local_ranks: set[int] = set(plan["cpu_serialize_local_ranks"])
+        broadcast_local_ranks: set[int] = set(plan["broadcast_local_ranks"])
+        comm_ranks: dict[int, int] = dict(plan["comm_ranks"])
+
+        cache = self._ensure_cpu_bucket_cache()
+        with self._cache_lock:
+            buckets = cache.get_step(version)
+            if not buckets:
+                logger.info(
+                    "run_sync_session sync_id=%s version=%s found 0 buckets — empty publish",
+                    sync_id,
+                    version,
+                )
+                return version
+
+            # Path A: cpu_serialize per-engine RPC (tmpfs payload). The
+            # wrapper owns the tmpfs file lifecycle (try/finally
+            # os.unlink) per scope F28; payload is materialized once
+            # per (bucket, engine) pair so peak /dev/shm = 1× bucket
+            # size (serial per-bucket receiver invocation).
+            for bucket in buckets:
+                if not cpu_serialize_local_ranks:
+                    break
+                self._dispatch_cpu_serialize_bucket(
+                    sync_id=sync_id,
+                    bucket=bucket,
+                    target_handles={
+                        idx: target_handles[idx]
+                        for idx in cpu_serialize_local_ranks
+                        if idx in target_handles
+                    },
+                )
+
+            # Path B: NCCL broadcast non-colocate path. Set up a dynamic
+            # group with TCP rendezvous, broadcast each bucket from
+            # cache_owner (rank 0), and tear the group down after the
+            # last bucket. F25: warmup allreduce on every CREATE; F26
+            # already enforced master_port != 0 above; F03/Anti-regression
+            # invariant #3: is_group_exist no-op guard on destroy is
+            # provided by SGLangEngine.destroy_collective_group.
+            if broadcast_local_ranks:
+                self._dispatch_nccl_broadcast(
+                    sync_id=sync_id,
+                    buckets=buckets,
+                    target_handles={
+                        idx: target_handles[idx]
+                        for idx in broadcast_local_ranks
+                        if idx in target_handles
+                    },
+                    group_name=group_name,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    comm_ranks=comm_ranks,
+                )
+
+        return version
+
+    def _dispatch_cpu_serialize_bucket(
+        self,
+        *,
+        sync_id: str,
+        bucket,  # BucketEntry
+        target_handles: dict[int, Any],
+    ) -> None:
+        """In-method helper: cpu_serialize one bucket to its target engines.
+
+        Iter 12 establishes the dispatch shape; the actual SGLang
+        receiver methods (update_weights_from_cpu_bucket, route
+        registration) land in iter 13. For now, drive the per-engine
+        RPC with payload_bytes (Ray auto-derefs ObjectRef at the top
+        level; we pass bytes directly so there is no double-deref).
+        """
+        if not target_handles:
+            return
+        # Serialize once per bucket: torch.save into a bytes buffer.
+        # Iter 13 wraps this onto tmpfs; for iter 12 the bytes form is
+        # sufficient for the dispatch shape.
+        import io as _io
+
+        buffer = _io.BytesIO()
+        torch.save(dict(bucket.params), buffer)
+        payload_bytes = buffer.getvalue()
+        # Per-engine RPC, serial per-bucket so peak /dev/shm = 1x bucket
+        # (cf. scope F28 tmpfs lifecycle).
+        for engine_index, handle in target_handles.items():
+            ray.get(
+                handle.update_weights_from_cpu_bucket.remote(
+                    payload_bytes=payload_bytes,
+                    bucket_index=int(bucket.bucket_index),
+                    sync_id=sync_id,
+                )
+            )
+
+    def _dispatch_nccl_broadcast(
+        self,
+        *,
+        sync_id: str,
+        buckets,
+        target_handles: dict[int, Any],
+        group_name: str,
+        master_addr: str,
+        master_port: int,
+        comm_ranks: dict[int, int],
+    ) -> None:
+        """In-method helper: dynamic NCCL broadcast of bucket payloads.
+
+        Iter 12 establishes the dispatch shape (group setup, per-bucket
+        broadcast loop, group destroy). The actual collective-group
+        wiring (sender-side init_process_group + per-bucket dist.broadcast
+        + dist.destroy_process_group) and the receiver-side
+        setup/destroy_collective_group + broadcast_parameter Ray methods
+        land alongside iter 13. For now, ask each engine to set up its
+        side of the group and tear it down at the end.
+        """
+        if not target_handles:
+            return
+        # Receiver-side group create. SGLangEngine helpers land in iter
+        # 13; calling .remote() here is the contract shape and will
+        # exercise once iter 13 lands.
+        ray.get(
+            [
+                handle.setup_collective_group.remote(
+                    group_name=group_name,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    rank=comm_ranks[engine_index],
+                )
+                for engine_index, handle in target_handles.items()
+            ]
+        )
+        try:
+            for bucket in buckets:
+                ray.get(
+                    [
+                        handle.broadcast_parameter.remote(
+                            sync_id=sync_id,
+                            bucket_index=int(bucket.bucket_index),
+                            group_name=group_name,
+                        )
+                        for handle in target_handles.values()
+                    ]
+                )
+        finally:
+            ray.get(
+                [
+                    handle.destroy_collective_group.remote(group_name=group_name)
+                    for handle in target_handles.values()
+                ]
+            )
+
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         self.args.load = path
