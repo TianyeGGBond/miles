@@ -601,9 +601,9 @@ class MegatronTrainRayActor(TrainRayActor):
         rank. cp_rank == 0 is implicit when cp_size == 1; the
         intra_dp_cp.rank predicate already covers it for cp_size > 1.
         """
+        # ``get_parallel_state`` lives in ``..training_utils.parallel`` (already
+        # imported at module top); ``mpu`` is megatron.core.parallel_state.
         from megatron.core import parallel_state as mpu
-
-        from .update_weight.common import get_parallel_state
 
         return (
             get_parallel_state().intra_dp_cp.rank == 0
@@ -623,78 +623,96 @@ class MegatronTrainRayActor(TrainRayActor):
     def build_cpu_bucket_cache(self, step: int) -> int:
         """F4 build: gather HF-format weights into CPU buckets for `step`.
 
-        Every rank participates in the implicit collective gather inside
-        ``named_params_and_buffers`` (it broadcasts/all-gathers across TP
-        / PP). Only the cache_owner stores the resulting tensors; other
-        ranks call ``put_empty_step`` so their ``_cache_ready_step``
-        pointer matches.
+        Reuses the existing ``HfWeightIteratorBase`` pipeline so the
+        produced tensors are full-shape HF-named (PP broadcast + EP
+        broadcast + TP all-gather + ``convert_to_hf`` already applied).
+        Plain ``named_params_and_buffers`` would only iterate per-rank
+        Megatron shards — wrong for the F4 receiver which expects whole
+        HF-format weights by name.
+
+        Every rank participates in the gather (so the cache_owner sees a
+        complete set). Only the cache_owner stores the resulting tensors;
+        other ranks call ``put_empty_step`` so their
+        ``_cache_ready_step`` pointer matches.
 
         ``step == -1`` is the init bootstrap path (base from-checkpoint
         weights); ``step >= 0`` is a post-training-step refresh.
 
         Returns the published step (echoed for caller logging).
         """
-        from .update_weight.common import named_params_and_buffers
         from .update_weight.cpu_bucket_cache import BucketEntry
+        from .update_weight.hf_weight_iterator_base import HfWeightIteratorBase
 
         cache = self._ensure_cpu_bucket_cache()
         is_owner = self._is_cache_owner_rank()
 
-        # Collective: every rank must participate even when not the owner.
-        named = named_params_and_buffers(
+        # Construct the HF iterator the same way self.weight_updater does
+        # internally, so the cache_owner sees identical name/shape/dtype
+        # conventions to the existing standalone broadcast path.
+        iterator = HfWeightIteratorBase.create(
             self.args,
             self.model,
-            convert_to_global_name=True,
-            translate_gpu_to_cpu=True,
+            model_name=(
+                type(self.hf_config).__name__.lower()
+                if self.args.model_name is None
+                else self.args.model_name
+            ),
+            quantization_config=getattr(self.hf_config, "quantization_config", None),
         )
-        # Materialize as a list to ensure the generator (if any) is consumed
-        # before the lock is acquired.
-        named_list = list(named) if named is not None else []
+        # The HF iterator pulls megatron-local weights from the same
+        # weights_backuper used by the standalone path; reuse the
+        # 'actor' tag so the rebuilt cache reflects the current actor
+        # weights.
+        megatron_local_weights = self.weights_backuper.get("actor")
 
         with self._cache_lock:
             if not is_owner:
-                # Non-owner ranks discard the gathered tensors but advance
-                # their pointer so upstream readiness checks see lockstep.
+                # Non-owner ranks must still drive the collective gather
+                # (each chunk is implicitly cross-rank inside
+                # _get_megatron_full_params + all_gather_params_async),
+                # but they discard the resulting tensors and advance
+                # their pointer in lockstep.
+                for _ in iterator.get_hf_weight_chunks(megatron_local_weights):
+                    pass
                 cache.put_empty_step(int(step))
                 return int(step)
 
-            # F4 bucket layout: pack (name, tensor) pairs into buckets up
-            # to max_bucket_size_bytes each. Tensors are HF-format and
-            # already on CPU (translate_gpu_to_cpu=True above); they may
-            # be pinned-host or paged depending on the upstream
-            # named_params_and_buffers implementation.
+            # F4 bucket layout (cache_owner only): pack (name, tensor)
+            # pairs into buckets up to max_bucket_size_bytes each. The
+            # iterator yields chunks of (name, hf_tensor); tensors come
+            # back on the GPU device (cuda.current_device()) for the
+            # standalone broadcast path, so we materialize to CPU here
+            # before storing — BucketEntry rejects CUDA tensors per the
+            # cpu_serialize transport contract.
             max_bytes = cache.max_bucket_size_bytes
             buckets: list[BucketEntry] = []
             current: dict[str, torch.Tensor] = {}
             current_bytes = 0
             current_elements = 0
             current_idx = 0
-            for name, tensor in named_list:
-                if not isinstance(tensor, torch.Tensor):
-                    continue
-                # Defensive: HF-format tensors ought to be on CPU after
-                # translate_gpu_to_cpu=True, but legacy paths may return
-                # CUDA tensors. Move to CPU rather than fail; the
-                # BucketEntry __post_init__ would otherwise reject it.
-                if tensor.is_cuda:
-                    tensor = tensor.detach().to("cpu")
-                tensor_bytes = tensor.element_size() * tensor.numel()
-                if current_bytes + tensor_bytes > max_bytes and current:
-                    buckets.append(
-                        BucketEntry(
-                            bucket_index=current_idx,
-                            params=current,
-                            size_bytes=current_bytes,
-                            element_count=current_elements,
+            for chunk in iterator.get_hf_weight_chunks(megatron_local_weights):
+                for name, tensor in chunk:
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    if tensor.is_cuda:
+                        tensor = tensor.detach().to("cpu")
+                    tensor_bytes = tensor.element_size() * tensor.numel()
+                    if current_bytes + tensor_bytes > max_bytes and current:
+                        buckets.append(
+                            BucketEntry(
+                                bucket_index=current_idx,
+                                params=current,
+                                size_bytes=current_bytes,
+                                element_count=current_elements,
+                            )
                         )
-                    )
-                    current_idx += 1
-                    current = {}
-                    current_bytes = 0
-                    current_elements = 0
-                current[name] = tensor
-                current_bytes += tensor_bytes
-                current_elements += tensor.numel()
+                        current_idx += 1
+                        current = {}
+                        current_bytes = 0
+                        current_elements = 0
+                    current[name] = tensor
+                    current_bytes += tensor_bytes
+                    current_elements += tensor.numel()
             if current:
                 buckets.append(
                     BucketEntry(
