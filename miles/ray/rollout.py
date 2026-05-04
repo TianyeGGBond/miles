@@ -576,30 +576,30 @@ class RolloutManager:
     def _init_engine_info_table(self) -> None:
         """Populate :attr:`_engines` from the updatable server's engines.
 
-        Standalone path: every alive (not-None) engine starts ``active``;
-        engine handles missing from the server (None / dead) start ``shell``.
+        Iter 4 scope: only the standalone-style construction is wired here —
+        every engine handle that ``start_rollout_servers`` returned is alive
+        with weights already loaded, so its state is ``active``. Missing /
+        dead handles map to ``shell``.
 
-        RLix-mode path: when ``all_engine_placements`` was passed and
-        ``active_engine_indices`` was the empty frozenset, every alive
-        engine starts ``offloaded`` (M11.2 init pattern). The runtime grant
-        path (iter 5 expand_engines) lifts a subset to ``loading``/``active``.
+        Note: the RLix M11.2 init pattern (``all_engine_placements`` plus
+        ``active_engine_indices=frozenset()`` to build only metadata slots
+        with NO SGLang server creation, then ``expand_engines`` grants
+        subsets) requires bypassing ``start_rollout_servers`` entirely. That
+        construction path lands with iter 5 (compound ops) and iter 26
+        (MilesPipeline init bootstrap). Iter 4 stores the RLix kwargs for
+        those iters to consume but does NOT mark engines ``offloaded`` here:
+        marking them offloaded without an actual ``release_memory_occupation``
+        call would lie about resident memory.
         """
         srv = self._get_updatable_server()
         engines = list(srv.engines) if srv else []
-        # In RLix mode the active set is explicitly supplied; in standalone
-        # mode treat every alive engine as active.
-        rlix_mode = bool(self._all_engine_placements)
         for idx, handle in enumerate(engines):
             if handle is None:
                 self._engines[idx] = EngineInfo(engine_index=idx, state="shell", handle=None)
                 continue
-            if rlix_mode:
-                state: EngineState = "active" if idx in self._active_engine_indices else "offloaded"
-            else:
-                state = "active"
             self._engines[idx] = EngineInfo(
                 engine_index=idx,
-                state=state,
+                state="active",
                 handle=handle,
             )
 
@@ -639,18 +639,18 @@ class RolloutManager:
         """
         self.health_monitoring_pause()
         if engine_indices is not None:
-            handles = self._engine_handles(engine_indices)
-            tag_list = tags
+            indices = self._resolve_engine_indices(engine_indices)
+            handles = [self._engines[idx].handle for idx in indices]
             results = (
-                ray.get([h.release_memory_occupation.remote(tags=tag_list) for h in handles])
+                ray.get([h.release_memory_occupation.remote(tags=tags) for h in handles])
                 if handles
                 else []
             )
-            for idx in self._resolve_engine_indices(engine_indices):
-                # Subset offload moves engines toward ``offloaded``; the full
-                # F2 disable lifecycle (active → disabling → offloaded) lands
-                # in iter 5 via shrink_engines. Iter 4's subset path is the
-                # data-plane primitive only.
+            # Subset offload moves engines toward ``offloaded``; the full F2
+            # disable lifecycle (active → disabling → offloaded) lands in iter
+            # 5 via shrink_engines. Iter 4's subset path is the data-plane
+            # primitive only.
+            for idx in indices:
                 self._engines[idx].state = "offloaded"
             return results
         if tags is not None:
@@ -669,16 +669,17 @@ class RolloutManager:
         engine_indices: Iterable[int] | None = None,
     ):
         if engine_indices is not None:
-            handles = self._engine_handles(engine_indices)
+            indices = self._resolve_engine_indices(engine_indices)
+            handles = [self._engines[idx].handle for idx in indices]
             results = (
                 ray.get([h.resume_memory_occupation.remote(tags=tags) for h in handles])
                 if handles
                 else []
             )
-            for idx in self._resolve_engine_indices(engine_indices):
-                # Subset onload is the data-plane primitive; the full
-                # ``offloaded → loading → active`` transition is driven by
-                # expand_engines + activate_routing (iter 5).
+            # Subset onload is the data-plane primitive; the full
+            # ``offloaded → loading → active`` transition is driven by
+            # expand_engines + activate_routing (iter 5).
+            for idx in indices:
                 if self._engines[idx].state == "offloaded":
                     self._engines[idx].state = "loading"
             return results
@@ -695,7 +696,8 @@ class RolloutManager:
 
     def onload_weights(self, engine_indices: Iterable[int] | None = None):
         if engine_indices is not None:
-            handles = self._engine_handles(engine_indices)
+            indices = self._resolve_engine_indices(engine_indices)
+            handles = [self._engines[idx].handle for idx in indices]
             return (
                 ray.get(
                     [h.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for h in handles]
@@ -708,7 +710,8 @@ class RolloutManager:
 
     def onload_kv(self, engine_indices: Iterable[int] | None = None):
         if engine_indices is not None:
-            handles = self._engine_handles(engine_indices)
+            indices = self._resolve_engine_indices(engine_indices)
+            handles = [self._engines[idx].handle for idx in indices]
             return (
                 ray.get(
                     [
