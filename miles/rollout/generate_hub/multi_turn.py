@@ -115,8 +115,10 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 multi_samples[-1].status = halt_status
             break
 
-        # F32 metadata injection requires a JSON body — force stream=False.
-        if isinstance(payload, dict):
+        # F32 metadata injection requires a JSON body — force stream=False
+        # under RLix mode only. Standalone keeps its pre-existing payload
+        # shape so existing exact-payload tests are unaffected.
+        if rlix_mode and isinstance(payload, dict):
             payload["stream"] = False
 
         if args.generate_multi_samples:
