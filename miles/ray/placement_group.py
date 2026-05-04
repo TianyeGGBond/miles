@@ -103,6 +103,19 @@ def create_placement_groups(args, *, external_provider=None):
         # establishes the dispatch shape; iter 15 + iter 25/26 wire
         # downstream consumers (RayTrainGroup worker_placements,
         # MilesPipeline init bootstrap).
+        #
+        # First build forbids critic / reward / RM (per F10 / C19
+        # single_updateable_model_and_server). Surface that as a
+        # KeyError-free shape: include "critic": None so legacy
+        # consumers reading pgs["critic"] either find None (and skip
+        # critic init) or, if they require a non-None value, fail
+        # explicitly rather than KeyError on the missing key.
+        if getattr(args, "use_critic", False):
+            raise RuntimeError(
+                "external_provider path is incompatible with use_critic=True; "
+                "RLix mode rejects critic / reward via F10 C19. Re-enabling "
+                "is follow-up after multi-server ModelUpdateService support."
+            )
         train_workers = external_provider.get_train_workers()
         rollout_workers = external_provider.get_all_rollout_engine_placements()
         external_provider.assert_structural(rollout_workers)
@@ -113,6 +126,7 @@ def create_placement_groups(args, *, external_provider=None):
         )
         return {
             "actor": train_workers,
+            "critic": None,  # explicit absence so any legacy reader sees None, not KeyError
             "rollout": rollout_workers,
         }
 

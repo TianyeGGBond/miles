@@ -122,6 +122,19 @@ class MilesPlacementProvider:
                 f"{infer_device_mapping}. Non-contiguous mapping requires the "
                 f"A18 / F95 scheduler_dp_rank adapter (follow-up)."
             )
+        # First-build also requires GAP-free (gpu_ids in each engine slice
+        # must be a contiguous integer run). E.g. infer_device_mapping=[0, 2]
+        # with tp=2 is sorted but the slice (0, 2) is not contiguous.
+        for engine_idx in range(len(infer_device_mapping) // int(rollout_num_gpus_per_engine)):
+            start = engine_idx * int(rollout_num_gpus_per_engine)
+            slice_ids = infer_device_mapping[start : start + int(rollout_num_gpus_per_engine)]
+            expected = list(range(slice_ids[0], slice_ids[0] + int(rollout_num_gpus_per_engine)))
+            if list(slice_ids) != expected:
+                raise ValueError(
+                    f"first build requires gap-free GPU ids per engine; engine "
+                    f"{engine_idx} got {slice_ids}, expected {expected}. Non-"
+                    f"contiguous mapping requires the A18 / F95 adapter."
+                )
 
         self._proxy = resource_manager_proxy
         self._train_device_mapping = list(train_device_mapping)
