@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from miles.utils.arguments import parse_args
@@ -8,8 +9,42 @@ from miles.utils.misc import should_run_periodic_action
 from miles.utils.tracking_utils import init_tracking
 
 
+def _assert_standalone_entry(args) -> None:
+    """F11 standalone fail-fast — refuse to run in RLix mode via this entry point.
+
+    The RLix entry driver is `examples/rlix/run_miles_rlix.py`. Standalone code path
+    (this file) MUST NOT be reached when `RLIX_CONTROL_PLANE=rlix` is set; doing so
+    would silently bypass scheduler-managed sleep/wake / partial overlap and degrade
+    to full-broadcast weight sync.
+
+    Also fail fast on the architectural precondition `train_devices ⊂ infer_devices`
+    when the user has accidentally configured a partial-overlap topology under the
+    standalone entry: that combination requires C20 router admission + cache-owner
+    sync, neither of which standalone has.
+    """
+    if os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+        raise RuntimeError(
+            "RLIX_CONTROL_PLANE=rlix is set but train_async.py is the standalone "
+            "entry. Use `examples/rlix/run_miles_rlix.py` for RLix-managed "
+            "scheduling, or unset RLIX_CONTROL_PLANE to run standalone."
+        )
+
+    # Partial-overlap topology guard. Standalone path assumes either fully colocated
+    # (`actor_train == actor_infer`) or fully disjoint allocation; partial overlap
+    # without RLix is unsafe.
+    actor_gpus = int(getattr(args, "actor_num_nodes", 1)) * int(getattr(args, "actor_num_gpus_per_node", 0))
+    rollout_gpus = getattr(args, "rollout_num_gpus", None)
+    if rollout_gpus is not None and actor_gpus > 0 and 0 < int(rollout_gpus) < actor_gpus:
+        raise RuntimeError(
+            "Partial-overlap topology detected (actor_train ⊂ actor_infer-equivalent) "
+            "without RLIX_CONTROL_PLANE=rlix. This configuration requires the RLix "
+            "scheduler entry driver — silent OOM via full-broadcast otherwise."
+        )
+
+
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 async def train(args):
+    _assert_standalone_entry(args)
     assert not args.colocate, "Colocation is not supported for async training."
     configure_logger()
     # allocate the GPUs

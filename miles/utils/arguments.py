@@ -1663,6 +1663,51 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_rlix_arguments(parser):
+            """RLix-mode tuning args.
+
+            All three are read by F4 / F1 / F10 paths. Defaults match the unified
+            plan (`plans/miles-port-unified-plan.md` §文件改动总清单 row for
+            arguments.py): bucket size 512 MB, post-sleep VRAM threshold 1.0 GB,
+            transport `cuda_ipc`. F10 startup validation forces `cpu_serialize`
+            for M11.1 RLix mode (vast.ai-style restricted containers without
+            `--ipc=host` / `CAP_SYS_PTRACE`); `cuda_ipc` is M11.6 follow-up.
+            """
+            parser.add_argument(
+                "--miles-model-update-bucket-size-mb",
+                type=int,
+                default=512,
+                help=(
+                    "RLix-mode CPU bucket cache size in MiB for F4 weight-refresh "
+                    "transport (cpu_serialize tmpfs payload + NCCL broadcast group). "
+                    "Larger buckets = fewer transports per sync but higher peak "
+                    "/dev/shm + RAM."
+                ),
+            )
+            parser.add_argument(
+                "--miles-post-sleep-vram-threshold-gb",
+                type=float,
+                default=1.0,
+                help=(
+                    "Post-sleep / post-offload SGLang server-side VRAM threshold in GiB "
+                    "(read from /server_info `memory_usage`). Anti-regression invariant "
+                    "#8: assert below this value after every sleep / release_memory_occupation "
+                    "to detect torch_memory_saver leak before the next training step."
+                ),
+            )
+            parser.add_argument(
+                "--model-update-transport",
+                type=str,
+                default="cuda_ipc",
+                choices=["cuda_ipc", "cpu_serialize"],
+                help=(
+                    "RLix-mode F4 transport for selective model-update colocate path. "
+                    "M11.1 RLix mode forces `cpu_serialize` (F10 startup fail-fast); "
+                    "`cuda_ipc` is M11.6 follow-up requiring smoke-test capability check."
+                ),
+            )
+            return parser
+
         def add_user_provided_function_arguments(parser):
             args_partial, _ = parser.parse_known_args()
             for path in [
@@ -1710,6 +1755,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_rlix_arguments(parser)
         if enable_experimental_rollout_refactor():
             parser = add_user_provided_function_arguments(parser)
 
