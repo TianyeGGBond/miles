@@ -443,16 +443,25 @@ class SGLangEngine(RayActor):
     def is_idle(self, timeout_s: float = 5.0) -> bool:
         """Return True iff the SGLang server has no in-flight or queued requests.
 
-        Reads ``GET /v1/loads`` and inspects ``slot["num_total_reqs"]`` (sum of
-        running + waiting). The plan explicitly forbids reading
-        ``/server_info``'s ``num_running_reqs`` field for this purpose because
-        it is missing the waiting-queue depth and is not present in all SGLang
-        versions.
+        Reads ``GET /v1/loads`` and inspects each per-DP entry's
+        ``num_total_reqs`` (running + waiting). Current SGLang
+        (``sglang/srt/entrypoints/v1_loads.py:get_loads``) returns:
 
-        Returns ``True`` when every slot reports ``num_total_reqs == 0``;
-        returns ``False`` if any slot is non-zero. Connection errors and
-        HTTP failures bubble up to the caller (used inside the abort-drain
-        loop, which has its own retry budget).
+            {
+                "timestamp": ..., "version": ..., "dp_rank_count": N,
+                "loads": [{ "num_running_reqs": ..., "num_waiting_reqs": ...,
+                            "num_total_reqs": ..., ... }, ...],
+                "aggregate": {"total_running_reqs": ..., "total_waiting_reqs": ...,
+                              "total_reqs": ..., ...}
+            }
+
+        The plan explicitly forbids reading ``/server_info``'s
+        ``num_running_reqs`` for this purpose (it is missing the waiting-queue
+        depth and is version-dependent).
+
+        Returns ``True`` when ``aggregate.total_reqs == 0``; falls back to
+        scanning ``loads[*].num_total_reqs`` if ``aggregate`` is missing.
+        Connection errors and HTTP failures bubble up to the caller.
         """
         if self.node_rank != 0:
             # Non-rank-0 nodes don't talk HTTP; defer to rank 0's verdict.
@@ -461,15 +470,22 @@ class SGLangEngine(RayActor):
         response = requests.get(url, timeout=timeout_s)
         response.raise_for_status()
         body = response.json()
-        slots = body.get("slots") if isinstance(body, dict) else None
-        if not isinstance(slots, list):
-            # Older SGLang shapes may put the list at the top level.
-            if isinstance(body, list):
-                slots = body
-            else:
-                raise RuntimeError(f"Unexpected /v1/loads payload shape: {body!r}")
-        for slot in slots:
-            if int(slot.get("num_total_reqs", 0)) != 0:
+        if not isinstance(body, dict):
+            raise RuntimeError(f"Unexpected /v1/loads payload shape: {body!r}")
+        aggregate = body.get("aggregate")
+        if isinstance(aggregate, dict) and "total_reqs" in aggregate:
+            return int(aggregate["total_reqs"]) == 0
+        loads = body.get("loads")
+        if not isinstance(loads, list):
+            raise RuntimeError(
+                f"/v1/loads response missing both 'aggregate.total_reqs' and "
+                f"'loads' list: {body!r}"
+            )
+        for entry in loads:
+            running = int(entry.get("num_running_reqs", 0))
+            waiting = int(entry.get("num_waiting_reqs", 0))
+            total = int(entry.get("num_total_reqs", running + waiting))
+            if total != 0:
                 return False
         return True
 
@@ -496,16 +512,28 @@ class SGLangEngine(RayActor):
     ) -> float:
         """Anti-regression invariant #8 — verify post-sleep VRAM is below threshold.
 
-        Reads SGLang ``/server_info`` ``memory_usage`` (reported in GiB) after
-        ``release_memory_occupation`` / sleep and raises if the resident VRAM
-        exceeds ``threshold_gb``. This is the *server-side* assert (distinct
-        from the train-side ``torch.cuda.memory_allocated`` assert which is
-        Layer 3 / M11.5 follow-up). Returns the observed memory_usage value
-        in GiB so callers can log it.
+        Reads SGLang ``/server_info`` after ``release_memory_occupation`` /
+        sleep, sums the per-DP ``internal_states[i].memory_usage`` categories
+        (``weight + kvcache + graph``, all in GiB), takes the max across DPs,
+        and raises if it exceeds ``threshold_gb``.
+
+        Current SGLang exposes memory in:
+
+            internal_states[i].memory_usage = {
+                "weight": <GiB>,
+                "kvcache": <GiB>,
+                "token_capacity": <int>,  # not memory; skip
+                "graph": <GiB>,
+            }
+
+        This is the *server-side* assert (distinct from the train-side
+        ``torch.cuda.memory_allocated`` assert which is Layer 3 / M11.5
+        follow-up). Returns the observed maximum memory_usage in GiB so
+        callers can log it.
 
         Notes:
-        - ``threshold_gb`` is typically ``args.miles_post_sleep_vram_threshold_gb``
-          (default 1.0 GiB).
+        - ``threshold_gb`` is typically
+          ``args.miles_post_sleep_vram_threshold_gb`` (default 1.0 GiB).
         - On non-rank-0 nodes this is a no-op returning ``0.0``.
         """
         if self.node_rank != 0:
@@ -514,21 +542,32 @@ class SGLangEngine(RayActor):
         response = requests.get(url, timeout=timeout_s)
         response.raise_for_status()
         body = response.json()
-        memory_usage_gb = body.get("memory_usage")
-        if memory_usage_gb is None:
+        internal_states = body.get("internal_states") if isinstance(body, dict) else None
+        if not isinstance(internal_states, list) or not internal_states:
             raise RuntimeError(
-                "/server_info response missing 'memory_usage' field; cannot enforce "
+                "/server_info response missing 'internal_states' list; cannot enforce "
                 "post-sleep VRAM threshold (Anti-regression invariant #8)"
             )
-        memory_usage_gb = float(memory_usage_gb)
-        if memory_usage_gb > float(threshold_gb):
+        memory_categories = ("weight", "kvcache", "graph")
+        observed_max_gb = 0.0
+        for state in internal_states:
+            mem = state.get("memory_usage") if isinstance(state, dict) else None
+            if not isinstance(mem, dict):
+                raise RuntimeError(
+                    "/server_info internal_states entry missing 'memory_usage' dict "
+                    "(Anti-regression invariant #8)"
+                )
+            total_gb = sum(float(mem.get(k, 0.0) or 0.0) for k in memory_categories)
+            observed_max_gb = max(observed_max_gb, total_gb)
+        if observed_max_gb > float(threshold_gb):
             raise RuntimeError(
-                f"Post-sleep VRAM {memory_usage_gb:.3f} GiB exceeds threshold "
+                f"Post-sleep VRAM {observed_max_gb:.3f} GiB (max across DPs, "
+                f"weight+kvcache+graph) exceeds threshold "
                 f"{float(threshold_gb):.3f} GiB on engine "
                 f"{self.server_host}:{self.server_port} — torch_memory_saver may "
                 f"have leaked. Check release_memory_occupation tags."
             )
-        return memory_usage_gb
+        return observed_max_gb
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """
