@@ -68,8 +68,11 @@ class RayTrainGroup:
         self._actor_handles: list = []
 
         try:
+            # Both helpers append to self._actor_handles as each actor
+            # is created so the except block below sees PARTIAL
+            # allocations on failure and can still kill them.
             if worker_placements is not None:
-                self._actor_handles = self._allocate_gpus_via_placements(
+                self._allocate_gpus_via_placements(
                     worker_placements, num_gpus_per_actor
                 )
             else:
@@ -90,8 +93,13 @@ class RayTrainGroup:
             self._actor_handles = []
             raise
 
-    def _allocate_gpus_via_placements(self, worker_placements, num_gpus_per_actor):
-        """RLix per-worker placement path. F33 / F34 / F36."""
+    def _allocate_gpus_via_placements(self, worker_placements, num_gpus_per_actor) -> None:
+        """RLix per-worker placement path. F33 / F34 / F36.
+
+        Appends each actor handle to ``self._actor_handles`` *as soon as
+        it is created* so the M4 cleanup path in :meth:`__init__` can
+        kill partial allocations on failure (codex review of iter 15).
+        """
         import os as _os
 
         env_vars_base = {
@@ -126,7 +134,6 @@ class RayTrainGroup:
             actor_impl = FSDPTrainRayActor
 
         world_size = len(worker_placements)
-        actor_handles: list = []
         master_addr: str | None = None
         master_port: int | None = None
         for rank, wp in enumerate(worker_placements):
@@ -143,13 +150,12 @@ class RayTrainGroup:
                     placement_group_bundle_index=wp.bundle_index,
                 ),
             ).remote(world_size, rank, master_addr, master_port, local_rank=0)
+            # Append IMMEDIATELY so __init__'s except block sees the
+            # partial allocation and can kill it. master_addr fetch
+            # below may raise; the cleanup path picks the actor up.
+            self._actor_handles.append(actor)
             if rank == 0:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
-            actor_handles.append(actor)
-            # Append BEFORE remote-init so the cleanup path can kill
-            # already-created actors if a later actor's options(...)
-            # call raises.
-        return actor_handles
 
     def collect_cache_owner_roles(self) -> list[tuple[int, bool, object]]:
         """F18 cache_owner uniqueness — fan-out report_cache_owner_role.
