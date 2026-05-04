@@ -123,7 +123,14 @@ class MilesRouter:
                 # them would fight the F2 disable lifecycle. Health-driven
                 # quarantine still applies once an enabled worker accumulates
                 # enough consecutive failures.
-                urls = [u for u in self.enabled_workers if u not in self.dead_workers]
+                #
+                # Legacy / test compat: when admission has never been declared
+                # (``enabled_workers`` is empty), fall back to probing the
+                # full registry the way the pre-iter-6 router did.
+                if self.enabled_workers:
+                    urls = [u for u in self.enabled_workers if u not in self.dead_workers]
+                else:
+                    urls = [u for u in self.worker_request_counts if u not in self.dead_workers]
                 if not urls:
                     continue
 
@@ -359,8 +366,22 @@ class MilesRouter:
         membership). Iter 7 wraps this in an asyncio.Condition for the
         C20 0-active suspend; iter 6 keeps the pre-C20 sync raise so
         existing standalone behavior is unchanged.
+
+        Backward-compat fallback: tests and legacy callers populate
+        ``worker_request_counts`` directly without going through
+        ``add_worker``, so ``enabled_workers`` stays empty in that
+        scenario. When no admission has been declared at all (i.e.
+        ``enabled_workers`` is empty), fall back to treating every
+        registered worker as admitted. Once ``add_worker`` /
+        ``disable_worker`` has been used at least once,
+        ``enabled_workers`` becomes the strict source of truth and the
+        fallback is bypassed.
         """
-        candidates = self.enabled_workers - self.dead_workers
+        if self.enabled_workers:
+            candidates = self.enabled_workers - self.dead_workers
+        else:
+            # Legacy / test compat path.
+            candidates = set(self.worker_request_counts) - self.dead_workers
         if not candidates:
             raise RuntimeError("No enabled live workers available in the pool")
         url = min(candidates, key=lambda u: self.worker_request_counts.get(u, 0))
