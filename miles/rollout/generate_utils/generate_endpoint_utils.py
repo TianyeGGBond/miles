@@ -108,3 +108,60 @@ def get_rollout_topk_from_response(args, output, sample, key):
         return None
     x = np.frombuffer(pybase64.b64decode(info.encode("ascii")), dtype=np.int32)
     return x.reshape(len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
+
+
+# ---------------------------------------------------------------------------
+# F3 turn-level redispatch helpers — snapshot/restore the sample state at
+# the boundary of a single multi_turn turn so a scheduler-preempt response
+# can be retried against a different engine without poisoning the sample.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_turn_state(sample: Sample, multi_samples: list[Sample]) -> dict[str, Any]:
+    """Capture every sample / multi_samples field mutated during one turn.
+
+    :func:`_restore_turn_state` rolls these back after a preempted turn so
+    the redispatch attempt against a different engine starts from the
+    same pre-turn state.
+
+    Sample-immutable fields (``prompt``, ``multimodal_inputs``) are not
+    captured — they are not mutated by ``update_sample_from_response``.
+    """
+    return {
+        "tokens": list(sample.tokens) if sample.tokens is not None else None,
+        "response": sample.response,
+        "response_length": sample.response_length,
+        "rollout_log_probs": (
+            list(sample.rollout_log_probs) if sample.rollout_log_probs is not None else None
+        ),
+        "loss_mask": list(sample.loss_mask) if sample.loss_mask is not None else None,
+        "status": sample.status,
+        "rollout_routed_experts": deepcopy(getattr(sample, "rollout_routed_experts", None)),
+        "multi_samples_len": len(multi_samples),
+    }
+
+
+def _restore_turn_state(
+    sample: Sample, multi_samples: list[Sample], snapshot: dict[str, Any]
+) -> None:
+    """Inverse of :func:`_snapshot_turn_state`.
+
+    Truncates ``multi_samples`` back to its pre-turn length and rolls back
+    the mutable fields on ``sample``. The caller (multi_turn.generate)
+    rebuilds the request payload after restore; the snapshot only covers
+    per-turn response state.
+    """
+    sample.tokens = list(snapshot["tokens"]) if snapshot["tokens"] is not None else None
+    sample.response = snapshot["response"]
+    sample.response_length = snapshot["response_length"]
+    sample.rollout_log_probs = (
+        list(snapshot["rollout_log_probs"])
+        if snapshot["rollout_log_probs"] is not None
+        else None
+    )
+    sample.loss_mask = list(snapshot["loss_mask"]) if snapshot["loss_mask"] is not None else None
+    sample.status = snapshot["status"]
+    sample.rollout_routed_experts = deepcopy(snapshot["rollout_routed_experts"])
+    target_len = int(snapshot["multi_samples_len"])
+    if len(multi_samples) > target_len:
+        del multi_samples[target_len:]
