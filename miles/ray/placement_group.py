@@ -79,8 +79,42 @@ def _create_placement_group(num_gpus):
     return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
 
 
-def create_placement_groups(args):
-    """Create placement groups for actor and rollout engines."""
+def create_placement_groups(args, *, external_provider=None):
+    """Create placement groups for actor and rollout engines.
+
+    Standalone path (``external_provider=None``) keeps the existing
+    self-allocating behavior: the function calls
+    :func:`_create_placement_group` directly with the derived total
+    GPU count and returns the legacy ``(pg, indices, gpu_ids)`` tuple
+    plus a per-pool offsets dict.
+
+    RLix path (``external_provider`` is a
+    :class:`MilesPlacementProvider`): the provider has already been
+    constructed by the F8 driver / coordinator with declared device
+    mappings. It returns per-worker placements via
+    :meth:`get_train_workers` and
+    :meth:`get_all_rollout_engine_placements`. We forward those to
+    callers (RolloutManager / RayTrainGroup) via a
+    ``{"actor": [...], "rollout": [...]}`` dict so the standalone
+    return shape is not broken.
+    """
+    if external_provider is not None:
+        # RLix path — delegate to the injected provider. Iter 14 only
+        # establishes the dispatch shape; iter 15 + iter 25/26 wire
+        # downstream consumers (RayTrainGroup worker_placements,
+        # MilesPipeline init bootstrap).
+        train_workers = external_provider.get_train_workers()
+        rollout_workers = external_provider.get_all_rollout_engine_placements()
+        external_provider.assert_structural(rollout_workers)
+        logger.info(
+            "RLix placement provider: %d train workers, %d rollout engines",
+            len(train_workers),
+            len(rollout_workers),
+        )
+        return {
+            "actor": train_workers,
+            "rollout": rollout_workers,
+        }
 
     num_gpus = 0
     if args.debug_train_only:
