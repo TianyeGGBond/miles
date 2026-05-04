@@ -263,7 +263,15 @@ async def generate_rollout_async(
     # plan; queued groups in worker.output_queue arrive via
     # bump_completed below. mode/adapter_id stay None for forward-
     # compat with M11.4 LoRA (X1 / F108).
-    current_weight_version = 0  # filled below if /model_info responds
+    #
+    # Query the live engine weight version from /model_info so the
+    # coordinator can key progress by the actual target version (the
+    # cached helper above throttles repeated lookups). Falls back to
+    # 0 if the engine is not yet responsive (initial batch before the
+    # first update_weights call).
+    current_weight_version = await _cached_version.get(args)
+    if current_weight_version is None:
+        current_weight_version = 0
     rlix_hooks.begin_progress_batch(
         target_weight_version=int(current_weight_version),
         step_target_groups=int(target_data_size),
@@ -362,8 +370,19 @@ async def generate_rollout_async(
             # F9 progress: report one completed group per accepted
             # group. The coordinator throttles its own emission; this
             # is the raw "collected" count fully_async produces.
+            #
+            # Use the live engine weight version (refreshed by
+            # _cached_version above when the staleness filter is on,
+            # or queried here on demand) so the coordinator keys
+            # progress by the actual target version, not by a stale
+            # batch-begin snapshot.
+            live_version = current_engine_version
+            if live_version is None:
+                live_version = await _cached_version.get(args)
+            if live_version is None:
+                live_version = current_weight_version
             try:
-                rlix_hooks.bump_completed(target_weight_version=int(current_weight_version))
+                rlix_hooks.bump_completed(target_weight_version=int(live_version))
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"rlix_hooks.bump_completed failed: {exc!r}")
             processed_any = True
