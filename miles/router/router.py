@@ -278,7 +278,14 @@ class MilesRouter:
         if engine_index is not None:
             meta_info["miles_engine_index"] = engine_index
         meta_info["miles_worker_url"] = worker_url
-        meta_info["miles_admission_disabled"] = worker_url not in self.enabled_workers
+        # Only report scheduler-preempt when admission has actually been
+        # declared. In the pre-admission legacy fallback mode the dispatch
+        # source of truth is worker_request_counts - dead_workers (not
+        # enabled_workers), so reading enabled_workers here would falsely
+        # mark every successfully-routed worker as preempted.
+        meta_info["miles_admission_disabled"] = (
+            self._admission_declared and worker_url not in self.enabled_workers
+        )
         # Strip Content-Encoding: the upstream may have gzipped the body, but
         # we returned it through httpx.aread() which already decoded into
         # bytes. Re-emitting the original content-coding header is wrong.
