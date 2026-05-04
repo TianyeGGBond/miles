@@ -727,6 +727,307 @@ class RolloutManager:
         for srv in self.servers.values():
             srv.onload_kv()
 
+    # ------------------------------------------------------------------
+    # F2 compound ops + admin (RLix-mode lifecycle)
+    # ------------------------------------------------------------------
+
+    def get_engine_count(self) -> int:
+        """Return the declared engine count (length of :attr:`_engines` table).
+
+        Includes shell entries. Iter 26 (MilesPipeline init) uses this for
+        the consistency assert "scheduler engine_count == declared engine_count".
+        """
+        return len(self._engines)
+
+    def get_engine_handles(self, engine_indices: Iterable[int]) -> dict[int, Any]:
+        """Read-only snapshot of per-engine handles for the given indices.
+
+        Used by ``MilesModelUpdateService.sync_selected_workers`` (iter 19/20)
+        at sync entry to fetch handles once and drive per-engine cpu_serialize
+        and NCCL broadcast RPCs without re-querying the manager.
+
+        Raises ``RuntimeError`` if any requested index is in ``shell`` state
+        (no handle to give).
+        """
+        snapshot: dict[int, Any] = {}
+        for idx in sorted(set(int(i) for i in engine_indices)):
+            if idx not in self._engines:
+                raise KeyError(f"unknown engine_index {idx}")
+            info = self._engines[idx]
+            if info.is_shell() or info.handle is None:
+                raise RuntimeError(
+                    f"engine_index {idx} is in state {info.state!r} with no live handle; "
+                    f"call expand_engines first"
+                )
+            snapshot[idx] = info.handle
+        return snapshot
+
+    def get_engine_states(self, engine_indices: Iterable[int]) -> dict[int, str]:
+        """Read-only entry-state snapshot — sibling to :meth:`get_engine_handles`.
+
+        ``MilesCoordinator._expand_workers`` (iter 23) reads this to dispatch
+        between INIT branch (entry state == ``shell``) and Runtime GENERATION
+        branch (entry state == ``offloaded``). Heterogeneous entry states
+        across the requested set must be detected upstream.
+        """
+        snapshot: dict[int, str] = {}
+        for idx in sorted(set(int(i) for i in engine_indices)):
+            if idx not in self._engines:
+                raise KeyError(f"unknown engine_index {idx}")
+            snapshot[idx] = self._engines[idx].state
+        return snapshot
+
+    def set_weight_version(
+        self,
+        version: int,
+        engine_indices: Iterable[int] | None = None,
+    ) -> int:
+        """Fan-out per-engine ``update_weight_version`` call.
+
+        Called only by ``MilesModelUpdateService.sync_selected_workers`` at the
+        end of the atomic sync unit (plan §F4 / scope F21: one publish per
+        sync). Pipeline / coordinator MUST NOT call this directly.
+
+        ``engine_indices=None`` falls back to all currently-active engines
+        (shell engines are always skipped — they have no SGLang server to
+        receive the update).
+
+        Returns the version actually published (echoed back for caller logging).
+        """
+        if engine_indices is None:
+            indices = sorted(
+                idx for idx, info in self._engines.items()
+                if info.state == "active" and info.handle is not None
+            )
+        else:
+            indices = self._resolve_engine_indices(engine_indices)
+        handles = [self._engines[idx].handle for idx in indices]
+        if handles:
+            ray.get(
+                [
+                    h.update_weight_version.remote(version=str(version))
+                    if hasattr(h, "update_weight_version")
+                    else h.update_weights_from_tensor.remote(  # legacy fallback
+                        serialized_named_tensors=[],
+                        flush_cache=False,
+                        weight_version=str(version),
+                    )
+                    for h in handles
+                ]
+            )
+        return int(version)
+
+    def _abort_engines(self, engine_indices: Iterable[int]) -> None:
+        """Idempotency-cached abort fan-out.
+
+        ``_preempted_engines`` is the ONLY remaining responsibility of this
+        attribute (per A19 / scope F03): abort-once idempotency. It MUST NOT
+        leak into routing / dispatch / attribution / resize-safety code.
+        """
+        if not hasattr(self, "_preempted_engines"):
+            self._preempted_engines: set[int] = set()
+        indices = self._resolve_engine_indices(engine_indices)
+        new_targets = [idx for idx in indices if idx not in self._preempted_engines]
+        if not new_targets:
+            return
+        handles = [self._engines[idx].handle for idx in new_targets]
+        ray.get([h.abort_all_requests.remote() for h in handles])
+        self._preempted_engines.update(new_targets)
+
+    def shrink_engines(
+        self,
+        engine_indices: Iterable[int],
+        *,
+        post_sleep_vram_threshold_gb: float | None = None,
+    ) -> list[int]:
+        """F2 abort-drain-sleep ordering for a subset of active engines.
+
+        Sequence (per scope F23):
+          1. Mark each target ``active → disabling``.
+          2. Abort all in-flight requests (``_abort_engines``).
+          3. Drain via ``is_idle`` poll until every target reports zero
+             outstanding requests.
+          4. ``release_memory_occupation()`` to release weights/KV/graph.
+          5. Optional: assert post-sleep VRAM below threshold (Anti-regression
+             invariant #8).
+          6. Mark each target ``disabling → offloaded``.
+
+        Returns the sorted list of engine indices actually shrunk.
+        """
+        indices = self._resolve_engine_indices(engine_indices)
+        if not indices:
+            return []
+        # Step 1: announce intent (admission close happens at the router via
+        # F3, iter 7+ — manager state alone doesn't gate dispatch in iter 5).
+        for idx in indices:
+            if self._engines[idx].state == "active":
+                self._engines[idx].state = "disabling"
+        # Steps 2 + 3: abort + drain.
+        self._abort_engines(indices)
+        handles = [self._engines[idx].handle for idx in indices]
+        deadline = time.time() + 30.0  # bounded test-side drain; production hardening = M11.5.
+        while time.time() < deadline:
+            verdicts = ray.get([h.is_idle.remote() for h in handles])
+            if all(verdicts):
+                break
+            time.sleep(0.1)
+        else:
+            still_busy = [
+                idx for idx, idle in zip(indices, ray.get([h.is_idle.remote() for h in handles]))
+                if not idle
+            ]
+            raise RuntimeError(
+                f"shrink_engines drain timeout after 30s; still busy: {still_busy}"
+            )
+        # Step 4: release memory.
+        ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
+        # Step 5: optional post-sleep VRAM assert.
+        if post_sleep_vram_threshold_gb is not None:
+            ray.get(
+                [
+                    h.assert_post_sleep_vram_below_threshold.remote(
+                        threshold_gb=post_sleep_vram_threshold_gb
+                    )
+                    for h in handles
+                ]
+            )
+        # Step 6: state transition.
+        for idx in indices:
+            self._engines[idx].state = "offloaded"
+            # Drop the abort idempotency cache once the engine is offloaded;
+            # next admission cycle starts fresh.
+            if hasattr(self, "_preempted_engines"):
+                self._preempted_engines.discard(idx)
+        return indices
+
+    def expand_engines(
+        self,
+        engine_indices: Iterable[int],
+    ) -> list[int]:
+        """Wake offloaded engines, leaving them in the ``loading`` state.
+
+        Iter 5 only handles the runtime path (``offloaded → loading``) via
+        ``resume_memory_occupation``. The ``shell → loading`` (full INIT)
+        branch needs a placement provider + actor-creation flow and lands
+        with iters 14/15/26.
+
+        After ``expand_engines`` returns, the engines are warm with weights
+        loaded but routing is NOT open. The full transition to ``active``
+        requires:
+          - ``MilesModelUpdateService.sync_selected_workers`` (iter 19/20) to
+            push a current weight version onto the engines, and
+          - ``activate_routing`` to add the engines to the router's enabled
+            set.
+        """
+        indices = sorted(set(int(i) for i in engine_indices))
+        for idx in indices:
+            if idx not in self._engines:
+                raise KeyError(f"unknown engine_index {idx}")
+            info = self._engines[idx]
+            if info.state == "shell":
+                raise RuntimeError(
+                    f"engine_index {idx} is shell; iter 5 does not implement the "
+                    f"shell → loading INIT branch (lands with iter 14/15/26 once "
+                    f"placement provider + actor-creation flow is in place)"
+                )
+            if info.state != "offloaded":
+                raise RuntimeError(
+                    f"engine_index {idx} state={info.state!r}, expected 'offloaded'"
+                )
+        handles = [self._engines[idx].handle for idx in indices]
+        if handles:
+            ray.get([h.resume_memory_occupation.remote(tags=None) for h in handles])
+        for idx in indices:
+            self._engines[idx].state = "loading"
+        return indices
+
+    def finish_init_offload(self, engine_indices: Iterable[int]) -> list[int]:
+        """``loading → offloaded`` transition for the INIT path.
+
+        Used by iter 26 ``MilesPipeline.initialize_pipeline`` Step 7: full INIT
+        creates engines with weights loaded (state ``loading``); then drops
+        weights/KV/graph WITHOUT a service.sync, version publish, or router
+        activation. After this call the engine is parked, ready to be granted
+        a runtime ``expand_engines + sync_selected_workers + activate_routing``
+        cycle when the scheduler signals.
+        """
+        indices = sorted(set(int(i) for i in engine_indices))
+        for idx in indices:
+            info = self._engines.get(idx)
+            if info is None:
+                raise KeyError(f"unknown engine_index {idx}")
+            if info.state != "loading":
+                raise RuntimeError(
+                    f"finish_init_offload requires state=='loading'; engine_index "
+                    f"{idx} is {info.state!r}"
+                )
+        handles = [self._engines[idx].handle for idx in indices]
+        if handles:
+            ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
+        for idx in indices:
+            self._engines[idx].state = "offloaded"
+        return indices
+
+    def activate_routing(self, engine_indices: Iterable[int]) -> list[int]:
+        """``loading → active`` transition; called by coordinator AFTER sync.
+
+        Iter 5 only updates manager-side state. The router-side admission
+        (``router.add_worker`` with ``engine_index=...``) is wired in iters
+        7–8 + 23 (coordinator orchestrates both manager and router).
+        """
+        indices = sorted(set(int(i) for i in engine_indices))
+        for idx in indices:
+            info = self._engines.get(idx)
+            if info is None:
+                raise KeyError(f"unknown engine_index {idx}")
+            if info.state != "loading":
+                raise RuntimeError(
+                    f"activate_routing requires state=='loading'; engine_index "
+                    f"{idx} is {info.state!r}"
+                )
+            self._engines[idx].state = "active"
+        return indices
+
+    def shutdown_hard(self) -> None:
+        """M4 minimal hard cleanup — terminate every alive engine actor.
+
+        Used by ``MilesPipeline`` (iter 27) on init-failure / dispose paths to
+        guarantee scheduler / Ray ledger consistency. CUDA context lives in
+        the SGLang server child processes, so killing the Ray actor handle is
+        only the first step; the SGLang server tree is killed via the actor's
+        existing ``shutdown`` method (which calls ``kill_process_tree`` on
+        ``self.process.pid``). We invoke that BEFORE ``ray.kill`` so the OS
+        children get SIGTERM rather than being orphaned.
+
+        Forbidden in M11.1 (Layer 3 deferred): graceful drain RPC, abort RPC,
+        30s + force-kill timeout, cleanup daemon, VRAM-threshold gate. This
+        is the intentionally minimal version.
+        """
+        # Stop background monitors first so they don't race with engine death.
+        for monitor in self._health_monitors:
+            try:
+                monitor.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"shutdown_hard: monitor.stop failed: {exc!r}")
+        # Best-effort SGLang server-tree shutdown, then ray.kill.
+        for idx, info in self._engines.items():
+            handle = info.handle
+            if handle is None:
+                continue  # shell — nothing to kill.
+            try:
+                # `shutdown` performs router /remove_worker + kill_process_tree.
+                ray.get(handle.shutdown.remote(), timeout=10.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"shutdown_hard: engine {idx} shutdown.remote() failed: {exc!r}"
+                )
+            try:
+                ray.kill(handle, no_restart=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"shutdown_hard: engine {idx} ray.kill failed: {exc!r}")
+            info.handle = None
+            info.state = "shell"
+
     def recover_updatable_engines(self):
         """Restart any dead rollout engines and update num_new_engines for update_weights detection.
 
