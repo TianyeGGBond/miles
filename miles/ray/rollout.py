@@ -7,7 +7,7 @@ import random
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Literal
 
 import numpy as np
 import ray
@@ -52,6 +52,58 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# F2 EngineInfo — RLix-mode 5-state machine (single source of truth)
+# ---------------------------------------------------------------------------
+
+# State semantics (plan §F2 / scope F24):
+#   - "shell"      : construction / pre-init slot reserved. No Ray actor, no SGLang
+#                    server, no GPU. ``bundle_index`` / ``gpu_ids`` / ``placement``
+#                    are populated; the only thing missing is the actor handle.
+#                    INIT transitions ``shell → loading`` via expand_engines (full
+#                    INIT only, iter 5).
+#   - "active"     : engine is serving traffic (router has admitted it,
+#                    weight version is set). Default state under standalone
+#                    full-init.
+#   - "disabling"  : router admission has been closed; abort-drain-sleep is in
+#                    progress. Transitions to ``offloaded`` after
+#                    release_memory_occupation completes.
+#   - "offloaded"  : engine actor is alive but its SGLang server has released
+#                    weights / KV / cuda_graph. Runtime expand transitions
+#                    ``offloaded → loading`` via wake_up + selective sync.
+#   - "loading"    : either INIT (post-create, pre-finish_init_offload) or
+#                    runtime (post-wake_up, pre-activate_routing). Transitions
+#                    to ``offloaded`` (INIT) or ``active`` (runtime) once
+#                    finish_init_offload / activate_routing completes.
+EngineState = Literal["shell", "active", "disabling", "offloaded", "loading"]
+
+
+@dataclasses.dataclass
+class EngineInfo:
+    """Per-engine metadata for the RolloutManager state machine.
+
+    The ``handle`` may be ``None`` only in the ``shell`` state. ``bundle_index``,
+    ``gpu_ids``, and ``node_rank`` are populated for every state including
+    ``shell`` (so RLix-mode INIT-time placement is fully described before any
+    actor is created).
+    """
+
+    engine_index: int
+    state: EngineState
+    handle: Any | None = None
+    bundle_index: int | None = None
+    gpu_ids: tuple[int, ...] = ()
+    node_rank: int = 0
+
+    def is_shell(self) -> bool:
+        return self.state == "shell"
+
+    def is_alive(self) -> bool:
+        """True iff a Ray actor handle exists (state in {active, disabling,
+        offloaded, loading})."""
+        return self.state != "shell" and self.handle is not None
 
 
 # ---------------------------------------------------------------------------
@@ -335,11 +387,40 @@ class RolloutServer:
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
 
-    def __init__(self, args, pg):
+    def __init__(
+        self,
+        args,
+        pg,
+        *,
+        all_engine_placements: list | None = None,
+        active_engine_indices: frozenset[int] | None = None,
+    ):
+        """Initialize a RolloutManager.
+
+        Standalone path passes only ``args`` and ``pg``; behavior is unchanged.
+
+        RLix-mode path additionally passes:
+          - ``all_engine_placements``: a list of ``WorkerPlacement`` (or
+            duck-typed equivalent) of length ``rollout_num_gpus //
+            rollout_num_gpus_per_engine``. Provided for the M11.2 init flow
+            where a Pipeline first allocates all engine slots and then expands
+            a subset; iter 14 introduces the concrete ``WorkerPlacement``
+            class. iter 4 stores it for later iters and uses it only to
+            populate :attr:`_engines` slot identities.
+          - ``active_engine_indices``: ``frozenset[int]`` of engine indices
+            that should be opened for routing at construction time. M11.2
+            init passes ``frozenset()`` and grants engines via expand_engines
+            (iter 5). Standalone passes ``None`` (legacy) and every server
+            engine starts in the ``active`` state.
+        """
         configure_logger()
 
         self.pg = pg
         self.args = args
+        self._all_engine_placements: list = list(all_engine_placements or [])
+        self._active_engine_indices: frozenset[int] = (
+            frozenset(active_engine_indices) if active_engine_indices is not None else frozenset()
+        )
         # TODO make args immutable
         init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
 
@@ -373,6 +454,16 @@ class RolloutManager:
             _start_session_server(args)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
+
+        # F2 EngineInfo state machine. Populated after start_rollout_servers
+        # so updatable-server engines map onto engine indices 0..N-1 (matches
+        # F12 contiguous-mapping invariant). Standalone path leaves every
+        # alive engine in the ``active`` state; RLix-mode path may pass
+        # ``active_engine_indices=frozenset()`` to start every engine in
+        # ``offloaded`` (M11.2 init) and grant subsets via expand_engines
+        # (iter 5).
+        self._engines: dict[int, EngineInfo] = {}
+        self._init_engine_info_table()
 
         self._metric_checker = MetricChecker.maybe_create(args)
         self._health_monitors = []
@@ -478,8 +569,90 @@ class RolloutManager:
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
 
-    def offload(self, tags: list[str] | None = None):
+    # ------------------------------------------------------------------
+    # F2 EngineInfo accessors + subset offload/onload (RLix-mode entry points)
+    # ------------------------------------------------------------------
+
+    def _init_engine_info_table(self) -> None:
+        """Populate :attr:`_engines` from the updatable server's engines.
+
+        Standalone path: every alive (not-None) engine starts ``active``;
+        engine handles missing from the server (None / dead) start ``shell``.
+
+        RLix-mode path: when ``all_engine_placements`` was passed and
+        ``active_engine_indices`` was the empty frozenset, every alive
+        engine starts ``offloaded`` (M11.2 init pattern). The runtime grant
+        path (iter 5 expand_engines) lifts a subset to ``loading``/``active``.
+        """
+        srv = self._get_updatable_server()
+        engines = list(srv.engines) if srv else []
+        # In RLix mode the active set is explicitly supplied; in standalone
+        # mode treat every alive engine as active.
+        rlix_mode = bool(self._all_engine_placements)
+        for idx, handle in enumerate(engines):
+            if handle is None:
+                self._engines[idx] = EngineInfo(engine_index=idx, state="shell", handle=None)
+                continue
+            if rlix_mode:
+                state: EngineState = "active" if idx in self._active_engine_indices else "offloaded"
+            else:
+                state = "active"
+            self._engines[idx] = EngineInfo(
+                engine_index=idx,
+                state=state,
+                handle=handle,
+            )
+
+    def _resolve_engine_indices(self, engine_indices: Iterable[int] | None) -> list[int]:
+        """Return a sorted list of indices whose engines have a live handle.
+
+        ``None`` means "all alive engines" (legacy behavior). Shell engines
+        are always excluded; subset operations targeting them must go through
+        ``expand_engines`` (iter 5) first.
+        """
+        if engine_indices is None:
+            return sorted(idx for idx, info in self._engines.items() if info.is_alive())
+        requested = sorted(set(int(i) for i in engine_indices))
+        for idx in requested:
+            if idx not in self._engines:
+                raise KeyError(f"unknown engine_index {idx}; known: {sorted(self._engines)}")
+            if not self._engines[idx].is_alive():
+                raise RuntimeError(
+                    f"engine_index {idx} is in state {self._engines[idx].state!r}; "
+                    f"call expand_engines first"
+                )
+        return requested
+
+    def _engine_handles(self, engine_indices: Iterable[int] | None) -> list[Any]:
+        return [self._engines[idx].handle for idx in self._resolve_engine_indices(engine_indices)]
+
+    def offload(
+        self,
+        tags: list[str] | None = None,
+        engine_indices: Iterable[int] | None = None,
+    ):
+        """Release memory occupation on the engines.
+
+        ``engine_indices=None`` matches legacy behavior (all alive engines).
+        Pass a subset to release just those engines (used by F2
+        shrink_engines, iter 5).
+        """
         self.health_monitoring_pause()
+        if engine_indices is not None:
+            handles = self._engine_handles(engine_indices)
+            tag_list = tags
+            results = (
+                ray.get([h.release_memory_occupation.remote(tags=tag_list) for h in handles])
+                if handles
+                else []
+            )
+            for idx in self._resolve_engine_indices(engine_indices):
+                # Subset offload moves engines toward ``offloaded``; the full
+                # F2 disable lifecycle (active → disabling → offloaded) lands
+                # in iter 5 via shrink_engines. Iter 4's subset path is the
+                # data-plane primitive only.
+                self._engines[idx].state = "offloaded"
+            return results
         if tags is not None:
             handles = [
                 engine.release_memory_occupation.remote(tags=tags)
@@ -490,7 +663,25 @@ class RolloutManager:
         for srv in self.servers.values():
             srv.offload()
 
-    def onload(self, tags: list[str] | None = None):
+    def onload(
+        self,
+        tags: list[str] | None = None,
+        engine_indices: Iterable[int] | None = None,
+    ):
+        if engine_indices is not None:
+            handles = self._engine_handles(engine_indices)
+            results = (
+                ray.get([h.resume_memory_occupation.remote(tags=tags) for h in handles])
+                if handles
+                else []
+            )
+            for idx in self._resolve_engine_indices(engine_indices):
+                # Subset onload is the data-plane primitive; the full
+                # ``offloaded → loading → active`` transition is driven by
+                # expand_engines + activate_routing (iter 5).
+                if self._engines[idx].state == "offloaded":
+                    self._engines[idx].state = "loading"
+            return results
         for srv in self.servers.values():
             srv.onload(tags)
 
@@ -502,11 +693,34 @@ class RolloutManager:
         for monitor in self._health_monitors:
             monitor.resume()
 
-    def onload_weights(self):
+    def onload_weights(self, engine_indices: Iterable[int] | None = None):
+        if engine_indices is not None:
+            handles = self._engine_handles(engine_indices)
+            return (
+                ray.get(
+                    [h.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for h in handles]
+                )
+                if handles
+                else []
+            )
         for srv in self.servers.values():
             srv.onload_weights()
 
-    def onload_kv(self):
+    def onload_kv(self, engine_indices: Iterable[int] | None = None):
+        if engine_indices is not None:
+            handles = self._engine_handles(engine_indices)
+            return (
+                ray.get(
+                    [
+                        h.resume_memory_occupation.remote(
+                            tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+                        )
+                        for h in handles
+                    ]
+                )
+                if handles
+                else []
+            )
         for srv in self.servers.values():
             srv.onload_kv()
 
