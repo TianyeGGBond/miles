@@ -803,17 +803,11 @@ class RolloutManager:
             indices = self._resolve_engine_indices(engine_indices)
         handles = [self._engines[idx].handle for idx in indices]
         if handles:
+            # SGLangEngine.update_weight_version(self, weight_version: str)
+            # — sglang_engine.py:671. Use the exact kwarg name; passing
+            # `version=` would raise TypeError inside the Ray actor.
             ray.get(
-                [
-                    h.update_weight_version.remote(version=str(version))
-                    if hasattr(h, "update_weight_version")
-                    else h.update_weights_from_tensor.remote(  # legacy fallback
-                        serialized_named_tensors=[],
-                        flush_cache=False,
-                        weight_version=str(version),
-                    )
-                    for h in handles
-                ]
+                [h.update_weight_version.remote(weight_version=str(version)) for h in handles]
             )
         return int(version)
 
