@@ -11,6 +11,19 @@ MUST NOT call ``ray.shutdown()``: failure semantics = let exceptions
 propagate naturally → driver exits → user runs ``ray stop`` to clean up.
 This is intentional minimalism: orchestrator-driven multi-pipeline
 cleanup is M11.5 follow-up (F81).
+
+KNOWN-GAP STUB (R07-F1) — this iter-16 surface establishes the env-var
+guard + F10 startup invariant + cluster_device_mappings derivation only.
+The orchestrator / coordinator / pipeline construction (orchestrator
+``request_gpus(actor_train + actor_infer)`` + ``MilesCoordinator`` actor
++ ``coordinator.create_pipeline_actor.remote(...)`` +
+``pipeline.initialize_pipeline()`` + main loop) is intentionally
+deferred to a future driver iter that wires the full RLix-side scheduler
+plumbing. Until that iter lands, invoking this script as
+``python -m examples.rlix.run_miles_rlix`` only validates topology and
+prints the derived mappings — no GPUs are allocated, no actors are
+created, no end-to-end run happens. M11.1 + M11.2 GPU smoke must wait
+for the wiring iter.
 """
 
 from __future__ import annotations
@@ -64,8 +77,12 @@ def main():
     args = parse_args()
 
     # F10 startup fail-fast — verify partial overlap topology + transport
-    # constraints BEFORE allocating any GPUs.
-    assert_rlix_topology(args, sglang_config=None)
+    # constraints BEFORE allocating any GPUs. R08-F1: pass
+    # ``args.sglang_config`` so C9 (PD-disaggregation forbidden) fires
+    # at the entry path. ``assert_rlix_topology`` also has an internal
+    # fallback to ``args.sglang_config`` when the kwarg is None, so this
+    # line is belt-and-suspenders.
+    assert_rlix_topology(args, sglang_config=getattr(args, "sglang_config", None))
 
     # M11.1 driver wiring (orchestrator allocate / register / admit +
     # MilesCoordinator + MilesPipeline) lands as RLix iters 17-27 +

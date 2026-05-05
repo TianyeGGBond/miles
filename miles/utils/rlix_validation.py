@@ -164,9 +164,21 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
     args
         Parsed MILES args namespace.
     sglang_config
-        Optional :class:`SglangConfig`. Required only for the PD-disaggregation
-        check (C9); skipped if not supplied.
+        Optional :class:`SglangConfig`. If unset, C9 falls back to
+        ``args.sglang_config`` (set by ``arguments.py``) so the
+        PD-disaggregation guard fires regardless of caller plumbing. The
+        explicit argument exists for callers that have already built /
+        mutated a separate config object and want to validate against
+        it.
     """
+    # Resolve the SglangConfig used for C9 once. Prefer an explicitly
+    # supplied config; otherwise fall back to args.sglang_config so the
+    # entry-driver path doesn't have to pre-build one (R08-F1 fix —
+    # without this, callers passing sglang_config=None would silently
+    # bypass C9, leaving PD-disaggregation configs unenforced).
+    effective_sglang_config = sglang_config
+    if effective_sglang_config is None:
+        effective_sglang_config = getattr(args, "sglang_config", None)
     train = _train_devices(args)
     infer = _infer_devices(args)
     engine_count = _infer_engine_count(args)
@@ -243,8 +255,13 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
             f"(got {getattr(args, 'sglang_data_parallel_size', None)!r})"
         )
 
-    # --- C9: PD disaggregation forbidden (only checkable when sglang_config supplied)
-    if sglang_config is not None and bool(getattr(sglang_config, "has_pd_disaggregation", False)):
+    # --- C9: PD disaggregation forbidden. Reads ``effective_sglang_config``
+    # which falls back to ``args.sglang_config`` when no explicit config
+    # is supplied — guarantees the guard fires from the entry-driver
+    # path even when sglang_config kwarg is None (R08-F1 fix).
+    if effective_sglang_config is not None and bool(
+        getattr(effective_sglang_config, "has_pd_disaggregation", False)
+    ):
         raise RuntimeError("C9: PD disaggregation is out of scope for this milestone")
 
     # --- C8: MoE / EP forbidden
