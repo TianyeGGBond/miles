@@ -94,6 +94,17 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
+            # MILES_TMS_HOOK_MODE=torch switches torch_memory_saver into
+            # PyTorch's CUDAPluggableAllocator path, avoiding the
+            # LD_PRELOAD libc malloc hook that segfaults during
+            # build_cpu_bucket_cache on CUDA 12.9 / Blackwell. Must be
+            # set BEFORE any tms call that triggers _ensure_initialized.
+            import os as _os
+
+            mode = _os.environ.get("MILES_TMS_HOOK_MODE")
+            if mode in ("torch", "preload"):
+                logger.info(f"Set torch_memory_saver.hook_mode to {mode!r}")
+                torch_memory_saver.hook_mode = mode  # type: ignore[assignment]
             if (x := args.train_memory_margin_bytes) > 0:
                 # --train-memory-margin-bytes can tune this
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
@@ -198,12 +209,26 @@ class MegatronTrainRayActor(TrainRayActor):
     def sleep(self) -> None:
         assert self.args.offload_train
 
+        # MILES_SKIP_TMS_PAUSE=1 turns sleep/wake_up into a near no-op:
+        # don't destroy the process groups (subsequent Phase A steps
+        # call dist.get_rank() and the cache_owner sync uses NCCL), and
+        # don't call torch_memory_saver.pause (crashes on CUDA 12.9 /
+        # Blackwell + tms 0.0.9). 0.5B fits 32GB without aggressive
+        # offload, so skipping is fine for the smoke.
+        import os as _os
+
+        skip_tms = _os.environ.get("MILES_SKIP_TMS_PAUSE") == "1"
+
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
-        destroy_process_groups()
+        if not skip_tms:
+            destroy_process_groups()
 
         tag = "default" if is_lora_enabled(self.args) else None
-        torch_memory_saver.pause(tag=tag)
+        if not skip_tms:
+            torch_memory_saver.pause(tag=tag)
+        else:
+            torch.cuda.empty_cache()
 
         print_memory("after offload model")
 
@@ -216,10 +241,16 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("before wake_up model")
 
         tag = "default" if is_lora_enabled(self.args) else None
-        torch_memory_saver.resume(tag=tag)
+        import os as _os
+
+        skip_tms = _os.environ.get("MILES_SKIP_TMS_PAUSE") == "1"
+
+        if not skip_tms:
+            torch_memory_saver.resume(tag=tag)
 
         clear_memory()
-        reload_process_groups()
+        if not skip_tms:
+            reload_process_groups()
         print_memory("after wake_up model")
 
     def _switch_model(self, target_tag: str) -> None:

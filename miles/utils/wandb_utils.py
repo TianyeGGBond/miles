@@ -2,7 +2,28 @@ import logging
 import os
 from copy import deepcopy
 
-import wandb
+# wandb's import chain depends on a newer protobuf than rlix pins (rlix
+# requires protobuf<3.21.0; wandb's generated wandb_telemetry_pb2.Imports
+# symbol comes from a newer protobuf). Tolerate the ImportError here so the
+# module is still loadable when nothing actually opted into wandb tracking.
+# All public entrypoints below short-circuit on ``args.use_wandb=False``.
+try:
+    import wandb
+except ImportError as _wandb_import_err:  # noqa: BLE001
+    wandb = None  # type: ignore[assignment]
+    _WANDB_IMPORT_ERR = _wandb_import_err
+else:
+    _WANDB_IMPORT_ERR = None
+
+
+def _require_wandb():
+    if wandb is None:
+        raise RuntimeError(
+            "wandb is not importable in this environment "
+            f"(original error: {_WANDB_IMPORT_ERR!r}). "
+            "Re-install a wandb version compatible with the ambient protobuf, "
+            "or pass --use-wandb=False."
+        )
 
 from miles.utils.env_report import decode_env_report
 

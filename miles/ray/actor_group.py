@@ -122,6 +122,12 @@ class RayTrainGroup:
             env_vars_base["LD_PRELOAD"] = dynlib_path
             env_vars_base["TMS_INIT_ENABLE"] = "1"
             env_vars_base["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+            # Per-actor switch into torch_memory_saver "torch" hook mode
+            # (CUDAPluggableAllocator) which avoids the LD_PRELOAD libc
+            # malloc hook that segfaults during build_cpu_bucket_cache on
+            # CUDA 12.9 / Blackwell. The actor reads this env at init.
+            if (mode := _os.environ.get("MILES_TMS_HOOK_MODE")):
+                env_vars_base["MILES_TMS_HOOK_MODE"] = mode
 
         backend = self.args.train_backend
         if backend == "megatron":

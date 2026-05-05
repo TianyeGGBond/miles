@@ -61,7 +61,6 @@ def main():
     from miles.utils.logging_utils import configure_logger
     from miles.utils.rlix_train_loop import run_async_train_loop
     from miles.utils.rlix_validation import assert_rlix_topology
-    from miles.utils.tracking_utils import init_tracking
     from rlix.pipeline.miles_coordinator import MilesCoordinator
     from rlix.protocol.types import RLIX_NAMESPACE, get_pipeline_namespace
 
@@ -85,8 +84,18 @@ def main():
         cluster_device_mappings,
     )
 
-    # MILES-side tracking backends (W&B / TensorBoard / Prometheus).
-    init_tracking(args)
+    # MILES-side tracking backends (W&B / TensorBoard / Prometheus). Lazily
+    # imported so the smoke run does not pull in wandb (which depends on a
+    # newer protobuf than rlix pins). Only initialize when the user opted
+    # in via --use-wandb / --use-tensorboard / --use-prometheus.
+    if (
+        getattr(args, "use_wandb", False)
+        or getattr(args, "use_tensorboard", False)
+        or getattr(args, "use_prometheus", False)
+    ):
+        from miles.utils.tracking_utils import init_tracking
+
+        init_tracking(args)
 
     # ---- 1. Connect to RLix; get the orchestrator. ---------------------------
     # ``rlix.init`` aliases ``rlix.client.client.connect``; with
@@ -147,6 +156,21 @@ def main():
     )
 
     # ---- 4. Create the named MilesCoordinator actor. -------------------------
+    # ROLL constants.py asserts ROLL_RAY_NAMESPACE + PIPELINE_ID are set when
+    # ``RLIX_CONTROL_PLANE=rlix`` BEFORE roll.* is imported. The coordinator's
+    # __init__ lazily imports ``roll.distributed.scheduler.resource_manager``
+    # so we propagate the identity vars via Ray runtime_env. Also set them on
+    # the driver's own env so any later in-driver roll import (e.g. via the
+    # placement provider) finds them.
+    pipeline_runtime_env_vars = {
+        "PIPELINE_ID": str(pipeline_id),
+        "ROLL_RAY_NAMESPACE": pipeline_namespace,
+        "RLIX_CONTROL_PLANE": "rlix",
+    }
+    if pythonpath := os.environ.get("PYTHONPATH"):
+        pipeline_runtime_env_vars["PYTHONPATH"] = pythonpath
+    os.environ["PIPELINE_ID"] = str(pipeline_id)
+    os.environ["ROLL_RAY_NAMESPACE"] = pipeline_namespace
     coordinator = (
         ray.remote(MilesCoordinator)
         .options(
@@ -154,6 +178,7 @@ def main():
             namespace=RLIX_NAMESPACE,
             lifetime="detached",
             num_cpus=0.01,
+            runtime_env={"env_vars": pipeline_runtime_env_vars},
         )
         .remote(pipeline_id=pipeline_id, pipeline_config=cfg)
     )

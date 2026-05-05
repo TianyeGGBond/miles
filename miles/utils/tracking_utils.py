@@ -1,6 +1,5 @@
 import logging
 
-import wandb
 from miles.utils.tensorboard_utils import _TensorboardAdapter
 
 from . import wandb_utils
@@ -22,6 +21,13 @@ def init_tracking(args, primary: bool = True, **kwargs):
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:
+        # Lazy import: ambient protobuf 3.20.x (pinned by rlix) breaks the
+        # eager wandb import chain (`wandb.proto.wandb_telemetry_pb2.Imports`
+        # was generated against a newer protobuf). Importing wandb only
+        # inside the gated branch keeps the module loadable when nothing
+        # actually opted into wandb tracking.
+        import wandb  # noqa: PLC0415
+
         wandb.log(metrics)
 
     if args.use_tensorboard:

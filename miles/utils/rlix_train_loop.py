@@ -125,11 +125,11 @@ async def run_async_train_loop(
                 finally:
                     await train_group.offload()
 
-        # 6) Optional eval (gated; smoke skips).
-        if getattr(args, "eval_interval", 0) and should_run_periodic_action(
-            rollout_id, args.eval_interval, num_rollout_per_epoch
-        ):
-            await rollout_manager.eval.remote(rollout_id)
+        # 6) Eval is intentionally skipped in rlix-mode smoke runs:
+        #    after_step has already offloaded the train group, and the
+        #    Megatron eval path requires onloaded weights. Restoring
+        #    eval needs an explicit onload→eval→offload bracket
+        #    (M11.1 follow-up).
 
         # 7) Dispatch the next rollout AFTER actor_train is released, so
         #    the new rollout does not race for partial-overlap GPUs.

@@ -160,11 +160,15 @@ class MilesPlacementProvider:
         startup structural asserts run in :meth:`assert_structural`.
         """
         engine_count = self.engine_count
-        # Ask the proxy for a PG covering the inference pool; the proxy
-        # is responsible for honoring the declared infer_device_mapping
-        # so the bundle_index sequence corresponds 1:1 to
-        # infer_device_mapping ordering.
-        pg = self._proxy.allocate_placement_group(
+        # Ask the proxy for a PG covering the inference pool. ROLL's
+        # ``ResourceManager.allocate_placement_group`` returns
+        # ``List[List[Dict]]`` (length=world_size, each inner list one dict
+        # per GPU with ``placement_group`` keying the Ray PG). In single-
+        # node deployments every dict references the same node-PG (a
+        # single-bundle PG containing all node GPUs); ``bundle_index`` is
+        # therefore always 0. We retain the per-engine indexing so the
+        # multi-node path stays correct when each engine's PG differs.
+        allocated = self._proxy.allocate_placement_group(
             world_size=len(self._infer_device_mapping),
             device_mapping=tuple(self._infer_device_mapping),
         )
@@ -174,6 +178,7 @@ class MilesPlacementProvider:
             global_slice = tuple(
                 self._infer_device_mapping[start : start + self._per_engine]
             )
+            pg = allocated[start][0]["placement_group"]
             # F102: derive node_rank from the first GLOBAL physical GPU
             # id of this slice. num_gpus_per_node tells us node
             # boundaries on a homogeneous cluster. Proxy is expected to
@@ -198,7 +203,7 @@ class MilesPlacementProvider:
             placements.append(
                 WorkerPlacement(
                     placement_group=pg,
-                    bundle_index=start,
+                    bundle_index=0,
                     gpu_ids=node_local_gpu_ids,
                     node_rank=int(node_rank),
                 )
@@ -244,17 +249,20 @@ class MilesPlacementProvider:
     def get_train_workers(self) -> list[WorkerPlacement]:
         """Per-worker placements for the train pool.
 
-        Calls
-        ``resource_manager_proxy.allocate_placement_group(world_size=...,
-        device_mapping=...)`` once and slices the resulting PG into
-        per-worker bundles (one bundle per train GPU).
+        ROLL's ``ResourceManager.allocate_placement_group`` returns
+        ``List[List[Dict]]`` (one outer entry per worker, inner entries one
+        per worker GPU; each dict carries ``placement_group``). For the
+        single-node, one-GPU-per-train-worker case every dict points at
+        the same node-PG (a single-bundle PG containing all node GPUs),
+        so ``bundle_index`` is always 0.
         """
-        pg = self._proxy.allocate_placement_group(
+        allocated = self._proxy.allocate_placement_group(
             world_size=len(self._train_device_mapping),
             device_mapping=tuple(self._train_device_mapping),
         )
         placements: list[WorkerPlacement] = []
         for idx, gpu_id in enumerate(self._train_device_mapping):
+            pg = allocated[idx][0]["placement_group"]
             # Each train worker holds exactly one GPU. Convert the
             # global id to node-local for WorkerPlacement.gpu_ids per
             # the multi-node invariant (R09-F1).
@@ -264,7 +272,7 @@ class MilesPlacementProvider:
             placements.append(
                 WorkerPlacement(
                     placement_group=pg,
-                    bundle_index=idx,
+                    bundle_index=0,
                     gpu_ids=(node_local_gpu,),
                     node_rank=int(node_rank),
                 )
