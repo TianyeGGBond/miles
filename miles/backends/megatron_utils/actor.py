@@ -917,19 +917,27 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> None:
         """In-method helper: dynamic NCCL broadcast of bucket payloads.
 
-        Iter 12 establishes the dispatch shape (group setup, per-bucket
-        broadcast loop, group destroy). The actual sender-side
-        ``init_process_group`` + per-bucket ``dist.broadcast`` +
-        ``dist.destroy_process_group`` is driven by
-        :class:`MilesModelUpdateService` (iter 19/20). For now, ask each
-        receiver engine to set up its side of the group, fan out
-        per-bucket ``broadcast_parameter`` with the HF-format metadata
-        SGLang's ``/update_weights_from_distributed`` route requires,
-        and tear the group down in ``finally`` (Anti-regression
-        invariant #3 idempotent destroy).
+        **MILES-side self-guard (cross-cutting review P1-8)**: the sender-
+        side ``init_process_group`` + per-bucket ``dist.broadcast`` +
+        ``dist.destroy_process_group`` is NOT yet wired here. The
+        receiver-side fan-out below (``setup_collective_group`` +
+        ``broadcast_parameter`` + ``destroy_collective_group``) would
+        block forever on ``init_weights_update_group`` waiting for an
+        absent rank-0 sender. Until the sender path lands, refuse to
+        even attempt the receiver-side setup so MILES does not depend
+        on the RLix-side service guard for safety. The MILES contract
+        is "zero RLix import dependency"; MILES must self-guard.
         """
         if not target_handles:
             return
+        raise NotImplementedError(
+            "broadcast transport requires sender-side NCCL "
+            "(init_process_group + dist.broadcast on the cache_owner). "
+            "Until the sender-side path lands, plans must route every "
+            "target through cpu_serialize. MilesModelUpdateService "
+            "already raises in iter 19/20; this MILES-side guard makes "
+            "the same invariant explicit at the receiver fan-out."
+        )
         if world_size <= 0:
             raise ValueError(
                 f"_dispatch_nccl_broadcast requires world_size > 0; got {world_size}"
