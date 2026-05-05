@@ -169,6 +169,19 @@ def main():
     }
     if pythonpath := os.environ.get("PYTHONPATH"):
         pipeline_runtime_env_vars["PYTHONPATH"] = pythonpath
+    # Forward smoke-only escape hatches so MilesCoordinator + child actors
+    # see them when reading os.environ (Ray runtime_env does not propagate
+    # the parent driver's env by default).
+    for _k in (
+        "MILES_TMS_HOOK_MODE",
+        "MILES_SKIP_TMS_PAUSE",
+        "MILES_SKIP_NODE_PG_PIN",
+        "TMS_INIT_ENABLE_CPU_BACKUP",
+        "CUDA_DEVICE_MAX_CONNECTIONS",
+        "NCCL_NVLS_ENABLE",
+    ):
+        if (_v := os.environ.get(_k)) is not None:
+            pipeline_runtime_env_vars[_k] = _v
     os.environ["PIPELINE_ID"] = str(pipeline_id)
     os.environ["ROLL_RAY_NAMESPACE"] = pipeline_namespace
     coordinator = (
