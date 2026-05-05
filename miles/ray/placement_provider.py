@@ -171,19 +171,35 @@ class MilesPlacementProvider:
         placements: list[WorkerPlacement] = []
         for engine_idx in range(engine_count):
             start = engine_idx * self._per_engine
-            slice_gpu_ids = tuple(self._infer_device_mapping[start : start + self._per_engine])
-            # F102: derive node_rank from the first physical GPU id of
-            # this slice. num_gpus_per_node tells us node boundaries on
-            # a homogeneous cluster. For multi-node deployments the
-            # proxy is expected to pin each engine slice to a single
-            # node; here we just record the rank for downstream
-            # placement-group bundle selection.
-            node_rank = slice_gpu_ids[0] // self._num_gpus_per_node
+            global_slice = tuple(
+                self._infer_device_mapping[start : start + self._per_engine]
+            )
+            # F102: derive node_rank from the first GLOBAL physical GPU
+            # id of this slice. num_gpus_per_node tells us node
+            # boundaries on a homogeneous cluster. Proxy is expected to
+            # pin each engine slice to a single node — verify that
+            # invariant here so multi-node configs fail fast at startup
+            # instead of producing invalid CVDs at actor spawn.
+            node_rank = global_slice[0] // self._num_gpus_per_node
+            slice_node_ranks = {g // self._num_gpus_per_node for g in global_slice}
+            if slice_node_ranks != {int(node_rank)}:
+                raise ValueError(
+                    f"engine_index={engine_idx} spans multiple nodes "
+                    f"(global_slice={global_slice}, node_ranks={sorted(slice_node_ranks)}); "
+                    f"first build requires each engine slice pinned to a single node."
+                )
+            # Store NODE-LOCAL gpu ids in WorkerPlacement.gpu_ids per
+            # the docstring/plan invariant — single-node deployments
+            # see global == node-local; multi-node deployments need the
+            # mod so CVD construction in actor_group.py:141 produces
+            # ids the per-node CUDA driver actually enumerates (R09-F1
+            # fix).
+            node_local_gpu_ids = tuple(g % self._num_gpus_per_node for g in global_slice)
             placements.append(
                 WorkerPlacement(
                     placement_group=pg,
                     bundle_index=start,
-                    gpu_ids=slice_gpu_ids,
+                    gpu_ids=node_local_gpu_ids,
                     node_rank=int(node_rank),
                 )
             )
@@ -239,12 +255,18 @@ class MilesPlacementProvider:
         )
         placements: list[WorkerPlacement] = []
         for idx, gpu_id in enumerate(self._train_device_mapping):
+            # Each train worker holds exactly one GPU. Convert the
+            # global id to node-local for WorkerPlacement.gpu_ids per
+            # the multi-node invariant (R09-F1).
+            global_gpu = int(gpu_id)
+            node_rank = global_gpu // self._num_gpus_per_node
+            node_local_gpu = global_gpu % self._num_gpus_per_node
             placements.append(
                 WorkerPlacement(
                     placement_group=pg,
                     bundle_index=idx,
-                    gpu_ids=(int(gpu_id),),
-                    node_rank=int(gpu_id) // self._num_gpus_per_node,
+                    gpu_ids=(node_local_gpu,),
+                    node_rank=int(node_rank),
                 )
             )
         return placements
@@ -267,13 +289,28 @@ class MilesPlacementProvider:
                     f"got {wp.gpu_ids}"
                 )
             expected_start = engine_idx * self._per_engine
-            expected = tuple(
+            global_expected = tuple(
                 self._infer_device_mapping[expected_start : expected_start + self._per_engine]
             )
-            if tuple(wp.gpu_ids) != expected:
+            # WorkerPlacement.gpu_ids is node-local (R09-F1) so compare
+            # against the node-local projection of the declared global
+            # slice. node_rank derived from the global slice's first id;
+            # all ids must share the rank (multi-node-spanning slice
+            # rejected at construction in get_all_rollout_engine_placements).
+            expected_node_rank = global_expected[0] // self._num_gpus_per_node
+            expected_node_local = tuple(
+                g % self._num_gpus_per_node for g in global_expected
+            )
+            if tuple(wp.gpu_ids) != expected_node_local:
                 raise RuntimeError(
-                    f"engine_index={engine_idx}: expected gpu_ids={expected}, "
+                    f"engine_index={engine_idx}: expected node-local gpu_ids="
+                    f"{expected_node_local} (from global slice {global_expected}), "
                     f"got {wp.gpu_ids}; first-build contiguous-mapping invariant"
+                )
+            if int(wp.node_rank) != int(expected_node_rank):
+                raise RuntimeError(
+                    f"engine_index={engine_idx}: expected node_rank="
+                    f"{expected_node_rank}, got {wp.node_rank}"
                 )
 
 
