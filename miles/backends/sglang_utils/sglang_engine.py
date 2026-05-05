@@ -843,9 +843,13 @@ class SGLangEngine(RayActor):
         the named collective group with an ``is_group_exist`` no-op
         guard.
 
-        SGLang exposes ``/destroy_weights_update_group``; failure to
-        exist must be tolerated (the cache_owner may have already torn
-        down the group via a prior session).
+        SGLang exposes ``/destroy_weights_update_group`` which returns
+        HTTP 200 on success and HTTP 400 BAD_REQUEST when the group does
+        not exist (sglang/srt/entrypoints/http_server.py). 404 never
+        appears for this route. We must tolerate the missing-group case
+        — the cache_owner may have already torn down the group via a
+        prior session — by treating 400 with a "group does not exist"
+        message as a no-op success.
         """
         if self.node_rank != 0:
             return {}
@@ -855,10 +859,21 @@ class SGLangEngine(RayActor):
                 {"group_name": group_name},
             )
         except requests.exceptions.HTTPError as exc:
-            # Treat 404 / "group does not exist" as a no-op success per
-            # invariant #3 (idempotent destroy).
-            if exc.response is not None and exc.response.status_code == 404:
-                return {"status": "noop"}
+            response = exc.response
+            if response is None:
+                raise
+            status = response.status_code
+            # SGLang returns 400 BAD_REQUEST on missing group; 404 kept
+            # as a defensive catch in case future SGLang versions move to
+            # 404 for the same condition.
+            if status in (400, 404):
+                body_text = ""
+                try:
+                    body_text = response.text or ""
+                except Exception:  # noqa: BLE001
+                    body_text = ""
+                if status == 404 or "group does not exist" in body_text.lower() or "does not exist" in body_text.lower():
+                    return {"status": "noop"}
             raise
 
     def broadcast_parameter(
