@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 
 import httpx
 import setproctitle
@@ -109,6 +110,14 @@ class MilesRouter:
         self.app.post("/disable_worker")(self.disable_worker)
         self.app.post("/enable_worker")(self.enable_worker)
         self.app.post("/remove_worker")(self.remove_worker)
+        # F76 DEV-ONLY-MVP test diagnostic endpoint. Gated on
+        # MILES_ROUTER_TEST_HOOKS=1 — production deployments leave
+        # the env flag off so this surface area is invisible. Used by
+        # future Gate 4 (f) sub-tests as a precise barrier (eliminates
+        # "wait some seconds and hope" race during admission_state
+        # transitions). Scaffolding-only; not Gate acceptance.
+        if os.environ.get("MILES_ROUTER_TEST_HOOKS") == "1":
+            self.app.get("/admission_state")(self.admission_state)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
 
@@ -378,6 +387,29 @@ class MilesRouter:
     async def list_workers(self, request: Request):
         """List all registered workers"""
         return {"urls": list(self.worker_request_counts.keys())}
+
+    async def admission_state(self, request: Request):
+        """F76 DEV-ONLY-MVP test diagnostic endpoint.
+
+        Returns a snapshot of the F3 admission lifecycle state for
+        external test harnesses. Registered only when
+        ``MILES_ROUTER_TEST_HOOKS=1`` is set at router startup. Body
+        is plain JSON; no body mutation, so the F73 header-hardening
+        path is not exercised.
+
+        SCAFFOLDING ONLY — NOT a Gate acceptance criterion. Production
+        deployments leave the env flag off so this endpoint is absent
+        from the FastAPI app entirely.
+        """
+        return {
+            "pipeline_id": getattr(self.args, "pipeline_id", None),
+            "admission_declared": bool(self._admission_declared),
+            "enabled_workers": sorted(self.enabled_workers),
+            "dead_workers": sorted(self.dead_workers),
+            "worker_request_counts": dict(self.worker_request_counts),
+            "worker_failure_counts": dict(self.worker_failure_counts),
+            "worker_engine_index_map": dict(self.worker_engine_index_map),
+        }
 
     # ------------------------------------------------------------------
     # F3 admission lifecycle helpers — stay sync per scope F14. Only the
