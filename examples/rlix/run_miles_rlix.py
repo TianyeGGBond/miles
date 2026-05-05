@@ -1,4 +1,4 @@
-"""F8 / F9 / F11 RLix entry driver — `examples/rlix/run_miles_rlix.py`.
+"""RLix-mode entry driver — `examples/rlix/run_miles_rlix.py`.
 
 Standalone entry stays at ``train_async.py``; this script is the RLix-mode
 entry. ``RLIX_CONTROL_PLANE=rlix`` MUST be set before any heavy import
@@ -9,21 +9,6 @@ are the hazard, not first-line imports).
 Per scope F13 the driver MUST NOT have a top-level ``try / except`` and
 MUST NOT call ``ray.shutdown()``: failure semantics = let exceptions
 propagate naturally → driver exits → user runs ``ray stop`` to clean up.
-This is intentional minimalism: orchestrator-driven multi-pipeline
-cleanup is M11.5 follow-up (F81).
-
-KNOWN-GAP STUB (R07-F1) — this iter-16 surface establishes the env-var
-guard + F10 startup invariant + cluster_device_mappings derivation only.
-The orchestrator / coordinator / pipeline construction (orchestrator
-``request_gpus(actor_train + actor_infer)`` + ``MilesCoordinator`` actor
-+ ``coordinator.create_pipeline_actor.remote(...)`` +
-``pipeline.initialize_pipeline()`` + main loop) is intentionally
-deferred to a future driver iter that wires the full RLix-side scheduler
-plumbing. Until that iter lands, invoking this script as
-``python -m examples.rlix.run_miles_rlix`` only validates topology and
-prints the derived mappings — no GPUs are allocated, no actors are
-created, no end-to-end run happens. M11.1 + M11.2 GPU smoke must wait
-for the wiring iter.
 """
 
 from __future__ import annotations
@@ -65,38 +50,173 @@ def main():
     """RLix entry. Imports heavy modules lazily so the env-var guard above
     fires before transitive ``import torch`` / ``import sglang``.
     """
-    # Lazy imports — must NOT be at module top so the env-var guard
-    # above fires first under transitive resolution.
-    import asyncio  # noqa: F401  -- kept for forward-compat with async main
+    import asyncio
+    import logging
+    from dataclasses import dataclass, field
+    from typing import Any, Optional
+
+    import ray
 
     from miles.utils.arguments import parse_args
     from miles.utils.logging_utils import configure_logger
+    from miles.utils.rlix_train_loop import run_async_train_loop
     from miles.utils.rlix_validation import assert_rlix_topology
+    from miles.utils.tracking_utils import init_tracking
+    from rlix.pipeline.miles_coordinator import MilesCoordinator
+    from rlix.protocol.types import RLIX_NAMESPACE, get_pipeline_namespace
+
+    import rlix
 
     configure_logger()
+    logger = logging.getLogger("run_miles_rlix")
     args = parse_args()
 
     # F10 startup fail-fast — verify partial overlap topology + transport
     # constraints BEFORE allocating any GPUs. R08-F1: pass
     # ``args.sglang_config`` so C9 (PD-disaggregation forbidden) fires
     # at the entry path. ``assert_rlix_topology`` also has an internal
-    # fallback to ``args.sglang_config`` when the kwarg is None, so this
-    # line is belt-and-suspenders.
+    # fallback to ``args.sglang_config`` when the kwarg is None.
     assert_rlix_topology(args, sglang_config=getattr(args, "sglang_config", None))
 
-    # M11.1 driver wiring (orchestrator allocate / register / admit +
-    # MilesCoordinator + MilesPipeline) lands as RLix iters 17-27 +
-    # iter 23 create_pipeline_actor. Iter 16 only establishes the entry
-    # surface and the F10 startup invariant; full wiring happens once
-    # the RLix-side modules exist.
     cluster_device_mappings = _build_cluster_device_mappings(args)
-    print(
+    logger.info(
         "[run_miles_rlix] F10 startup validation passed; "
-        f"cluster_device_mappings={cluster_device_mappings}"
+        "cluster_device_mappings=%s",
+        cluster_device_mappings,
     )
-    print(
-        "[run_miles_rlix] Iter 16 entry stub. RLix coordinator + pipeline "
-        "wiring lands in iters 21-27. Re-run after those iters land."
+
+    # MILES-side tracking backends (W&B / TensorBoard / Prometheus).
+    init_tracking(args)
+
+    # ---- 1. Connect to RLix; get the orchestrator. ---------------------------
+    # ``rlix.init`` aliases ``rlix.client.client.connect``; with
+    # ``create_if_missing=True`` it creates the singleton orchestrator
+    # actor on the head node. The orchestrator constructor calls
+    # ``_ensure_scheduler_singleton`` which creates and initializes the
+    # central scheduler — no separate scheduler bootstrap needed.
+    orchestrator = rlix.init(create_if_missing=True)
+
+    # ---- 2. Allocate, register, and admit the pipeline. ----------------------
+    pipeline_id = ray.get(orchestrator.allocate_pipeline_id.remote("miles"))
+    pipeline_namespace = get_pipeline_namespace(pipeline_id)
+    logger.info(
+        "[run_miles_rlix] allocated pipeline_id=%s namespace=%s",
+        pipeline_id,
+        pipeline_namespace,
+    )
+
+    cluster_tp_configs = {
+        "actor_train": int(args.actor_num_gpus_per_node),
+        "actor_infer": int(args.rollout_num_gpus_per_engine),
+    }
+    ray.get(
+        orchestrator.register_pipeline.remote(
+            pipeline_id=pipeline_id,
+            ray_namespace=pipeline_namespace,
+            cluster_tp_configs=cluster_tp_configs,
+            cluster_device_mappings=cluster_device_mappings,
+        )
+    )
+    ray.get(orchestrator.admit_pipeline.remote(pipeline_id=pipeline_id))
+    logger.info(
+        "[run_miles_rlix] pipeline registered + admitted pipeline_id=%s",
+        pipeline_id,
+    )
+
+    # ---- 3. Build the MilesPipelineConfig wrapper. ---------------------------
+    @dataclass
+    class MilesPipelineConfig:
+        miles_args: Any
+        sglang_config: Optional[Any] = None
+        verify_model_after_sync: bool = False
+        num_gpus_per_node: int = 8
+        # ``system_envs`` is writeable so MilesCoordinator._inject_pipeline_env_vars
+        # can mutate the deepcopy without hitting a frozen-dataclass error.
+        system_envs: dict = field(default_factory=dict)
+
+    # ``num_gpus_per_node`` defaults to actor_num_gpus_per_node when the
+    # arg is absent; RLix uses this for placement-group bundle sizing.
+    cfg = MilesPipelineConfig(
+        miles_args=args,
+        sglang_config=getattr(args, "sglang_config", None),
+        verify_model_after_sync=bool(getattr(args, "verify_model_after_sync", False)),
+        num_gpus_per_node=int(
+            getattr(args, "num_gpus_per_node", None) or args.actor_num_gpus_per_node
+        ),
+        system_envs={},
+    )
+
+    # ---- 4. Create the named MilesCoordinator actor. -------------------------
+    coordinator = (
+        ray.remote(MilesCoordinator)
+        .options(
+            name=f"miles_coordinator_{pipeline_id}",
+            namespace=RLIX_NAMESPACE,
+            lifetime="detached",
+            num_cpus=0.01,
+        )
+        .remote(pipeline_id=pipeline_id, pipeline_config=cfg)
+    )
+    logger.info(
+        "[run_miles_rlix] MilesCoordinator created pipeline_id=%s",
+        pipeline_id,
+    )
+
+    # ---- 5. Create the per-pipeline MilesPipeline actor + initialize. --------
+    pipeline = ray.get(coordinator.create_pipeline_actor.remote(pipeline_config=cfg))
+    ray.get(pipeline.initialize_pipeline.remote(coordinator_handle=coordinator))
+    logger.info(
+        "[run_miles_rlix] MilesPipeline.initialize_pipeline complete pipeline_id=%s",
+        pipeline_id,
+    )
+
+    # ---- 6. Pull train_group + rollout_manager handles via the new accessors.
+    train_group = ray.get(pipeline.get_train_group.remote())
+    rollout_manager = ray.get(pipeline.get_rollout_manager.remote())
+    declared_engine_count = int(ray.get(pipeline.get_declared_engine_count.remote()))
+    logger.info(
+        "[run_miles_rlix] pulled handles train_group=ok rollout_manager=ok engines=%d",
+        declared_engine_count,
+    )
+
+    # ---- 7-9. Run the async setup-and-loop block. ---------------------------
+    # Wrap set_rollout_manager + base v=-1 sync + loop into a single async
+    # entry so we use exactly one ``asyncio.run`` (avoids dangling event-loop
+    # state between separate runs).
+    async def _async_main():
+        # Wire the train group to the rollout manager. Standalone does this
+        # in ``create_training_models``; in RLix mode the pipeline does not.
+        await train_group.set_rollout_manager(rollout_manager)
+
+        # Base v=-1 weight sync to active engines via the coordinator. Phase A
+        # built buckets for step=-1; Phase B registered handles + bootstrapped
+        # the active set. ``ray.get`` blocks the event loop for the duration
+        # of the sync RPC, which is acceptable: nothing else is in flight here.
+        ray.get(coordinator.sync_base_weights_to_active.remote(-1))
+        logger.info("[run_miles_rlix] base v=-1 weight sync complete")
+
+        async def _before(step: int) -> None:
+            await pipeline.before_training.remote(step)
+
+        async def _after(step: int) -> None:
+            await pipeline.after_training.remote(step)
+
+        await run_async_train_loop(
+            args,
+            train_group=train_group,
+            rollout_manager=rollout_manager,
+            before_step=_before,
+            after_step=_after,
+        )
+
+    asyncio.run(_async_main())
+    logger.info("[run_miles_rlix] training loop complete pipeline_id=%s", pipeline_id)
+
+    # ---- 10. Clean shutdown via the pipeline actor. -------------------------
+    ray.get(pipeline.shutdown_hard.remote())
+    logger.info(
+        "[run_miles_rlix] shutdown_hard complete pipeline_id=%s — exiting",
+        pipeline_id,
     )
 
 
