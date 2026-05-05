@@ -788,19 +788,20 @@ class RolloutManager:
         end of the atomic sync unit (plan §F4 / scope F21: one publish per
         sync). Pipeline / coordinator MUST NOT call this directly.
 
-        ``engine_indices=None`` falls back to all currently-active engines
+        ``engine_indices=None`` falls back to all currently-alive engines
         (shell engines are always skipped — they have no SGLang server to
-        receive the update).
+        receive the update). "Alive" includes ``loading`` because the
+        runtime-expand path publishes the version BEFORE
+        ``activate_routing`` flips state to ``active``; if we filtered on
+        ``state == "active"`` here, runtime-expanded engines would come up
+        active with stale weight_version. Both branches now share the
+        ``_resolve_engine_indices`` predicate so explicit-list and None
+        produce the same fan-out for the same logical set (per scope F21
+        engine-table contract).
 
         Returns the version actually published (echoed back for caller logging).
         """
-        if engine_indices is None:
-            indices = sorted(
-                idx for idx, info in self._engines.items()
-                if info.state == "active" and info.handle is not None
-            )
-        else:
-            indices = self._resolve_engine_indices(engine_indices)
+        indices = self._resolve_engine_indices(engine_indices)
         handles = [self._engines[idx].handle for idx in indices]
         if handles:
             # SGLangEngine.update_weight_version(self, weight_version: str)
@@ -814,9 +815,14 @@ class RolloutManager:
     def _abort_engines(self, engine_indices: Iterable[int]) -> None:
         """Idempotency-cached abort fan-out.
 
-        ``_preempted_engines`` is the ONLY remaining responsibility of this
-        attribute (per A19 / scope F03): abort-once idempotency. It MUST NOT
-        leak into routing / dispatch / attribution / resize-safety code.
+        ``_preempted_engines`` is the abort-idempotency cache for this
+        method (per A19 / scope F03): abort-once-per-admission-cycle. The
+        cache MUST NOT be promoted to routing / dispatch / attribution /
+        resize-safety state — that responsibility lives entirely in
+        ``router.enabled_workers``. The only sanctioned mutation surface
+        is this method plus the ``_release_abort_idempotency_for`` /
+        ``_reset_abort_idempotency_for`` helpers below — together they
+        own the cache lifecycle.
         """
         if not hasattr(self, "_preempted_engines"):
             self._preempted_engines: set[int] = set()
@@ -827,6 +833,32 @@ class RolloutManager:
         handles = [self._engines[idx].handle for idx in new_targets]
         ray.get([h.abort_all_requests.remote() for h in handles])
         self._preempted_engines.update(new_targets)
+
+    def _release_abort_idempotency_for(self, engine_indices: Iterable[int]) -> None:
+        """Drop ``_preempted_engines`` cache entries on successful offload.
+
+        Companion to ``_abort_engines`` — clears the abort-idempotency
+        cache for indices that have transitioned to ``offloaded`` so the
+        next admission cycle starts fresh. Lives next to ``_abort_engines``
+        so the cache lifecycle (init / update / discard) is owned in one
+        place per A19 / scope F03.
+        """
+        if not hasattr(self, "_preempted_engines"):
+            return
+        for idx in engine_indices:
+            self._preempted_engines.discard(int(idx))
+
+    def _reset_abort_idempotency_for(self, engine_indices: Iterable[int]) -> None:
+        """Drop cache entries when a shrink cycle fails so retry re-aborts.
+
+        On ``shrink_engines`` failure between abort and offload-flip, the
+        cached indices are still ``disabling`` and any new in-flights
+        that arrived during the failure must be aborted on retry. This
+        helper makes that drop explicit.
+        """
+        # Same body as _release_abort_idempotency_for; named distinctly
+        # so callers document intent.
+        self._release_abort_idempotency_for(engine_indices)
 
     def shrink_engines(
         self,
@@ -856,42 +888,51 @@ class RolloutManager:
         for idx in indices:
             if self._engines[idx].state == "active":
                 self._engines[idx].state = "disabling"
-        # Steps 2 + 3: abort + drain.
-        self._abort_engines(indices)
-        handles = [self._engines[idx].handle for idx in indices]
-        deadline = time.time() + 30.0  # bounded test-side drain; production hardening = M11.5.
-        while time.time() < deadline:
-            verdicts = ray.get([h.is_idle.remote() for h in handles])
-            if all(verdicts):
-                break
-            time.sleep(0.1)
-        else:
-            still_busy = [
-                idx for idx, idle in zip(indices, ray.get([h.is_idle.remote() for h in handles]))
-                if not idle
-            ]
-            raise RuntimeError(
-                f"shrink_engines drain timeout after 30s; still busy: {still_busy}"
-            )
-        # Step 4: release memory.
-        ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
-        # Step 5: optional post-sleep VRAM assert.
-        if post_sleep_vram_threshold_gb is not None:
-            ray.get(
-                [
-                    h.assert_post_sleep_vram_below_threshold.remote(
-                        threshold_gb=post_sleep_vram_threshold_gb
-                    )
-                    for h in handles
+        # Steps 2-5 are wrapped so a mid-sequence failure resets the abort
+        # idempotency cache — otherwise retry's _abort_engines would skip
+        # the already-cached indices and the drain would re-stall.
+        try:
+            # Steps 2 + 3: abort + drain.
+            self._abort_engines(indices)
+            handles = [self._engines[idx].handle for idx in indices]
+            deadline = time.time() + 30.0  # bounded test-side drain; production hardening = M11.5.
+            while time.time() < deadline:
+                verdicts = ray.get([h.is_idle.remote() for h in handles])
+                if all(verdicts):
+                    break
+                time.sleep(0.1)
+            else:
+                still_busy = [
+                    idx for idx, idle in zip(indices, ray.get([h.is_idle.remote() for h in handles]))
+                    if not idle
                 ]
-            )
-        # Step 6: state transition.
+                raise RuntimeError(
+                    f"shrink_engines drain timeout after 30s; still busy: {still_busy}"
+                )
+            # Step 4: release memory.
+            ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
+            # Step 5: optional post-sleep VRAM assert.
+            if post_sleep_vram_threshold_gb is not None:
+                ray.get(
+                    [
+                        h.assert_post_sleep_vram_below_threshold.remote(
+                            threshold_gb=post_sleep_vram_threshold_gb
+                        )
+                        for h in handles
+                    ]
+                )
+        except Exception:
+            # Reset the abort cache on failure so retry re-aborts new
+            # in-flights that arrived during the failed cycle.
+            self._reset_abort_idempotency_for(indices)
+            raise
+        # Step 6: state transition + abort-cache cleanup. Cache cleanup
+        # owned by _abort_engines's companion helper so the Layer-1
+        # invariant ("cache lifecycle owned by _abort_engines and its
+        # private helpers") reads literally.
         for idx in indices:
             self._engines[idx].state = "offloaded"
-            # Drop the abort idempotency cache once the engine is offloaded;
-            # next admission cycle starts fresh.
-            if hasattr(self, "_preempted_engines"):
-                self._preempted_engines.discard(idx)
+        self._release_abort_idempotency_for(indices)
         return indices
 
     def expand_engines(
