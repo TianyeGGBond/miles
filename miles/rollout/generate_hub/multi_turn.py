@@ -75,14 +75,18 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     args = input.args
     sample = deepcopy(input.sample)
     tokenizer = input.state.tokenizer
-    # F29: RLix-mode partial_rollout is forbidden (radix middleware off,
-    # turn-level redispatch requires non-streaming JSON). Standalone is
-    # left untouched (legacy partial_rollout configurations remain valid).
+    # multi_turn.generate has never implemented partial-rollout resume
+    # semantics (no `len(sample.response) > 0` short-circuit like
+    # single_turn.py); prior responses would be silently re-tokenized as
+    # fresh prompts. The unconditional assert preserves the long-standing
+    # standalone safety guard. Under RLix mode the same constraint stands
+    # (F29 / C17): radix middleware is off, turn-level redispatch
+    # requires non-streaming JSON, and partial_rollout has no place in
+    # either mode.
     rlix_mode = _is_rlix_mode()
-    if rlix_mode:
-        assert not args.partial_rollout, (
-            "Partial rollout is not supported under RLix mode (F29 / C17)"
-        )
+    assert not args.partial_rollout, (
+        "Partial rollout is not supported in multi_turn.generate (F29 / C17)"
+    )
 
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
