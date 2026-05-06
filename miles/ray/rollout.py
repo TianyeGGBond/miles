@@ -222,7 +222,16 @@ class ServerGroup:
                 args=self.args, rollout_engines=rollout_engines
             )
         else:
-            base_port = max(port_cursors.values()) if port_cursors else 15000
+            # Per-pipeline base port via MILES_ROLLOUT_BASE_PORT env var.
+            # Two MilesPipeline actors on the same Ray cluster both call
+            # find_available_port concurrently; a shared default of 15000
+            # races on the first probe (both check, both see free, both
+            # try to bind, one crashes). The dual-pipeline driver passes
+            # disjoint base ports per pipeline (e.g. 15000, 16000) so the
+            # find-free-port windows never overlap.
+            _env_base = os.environ.get("MILES_ROLLOUT_BASE_PORT")
+            _default_base = int(_env_base) if _env_base else 15000
+            base_port = max(port_cursors.values()) if port_cursors else _default_base
             addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
                 args=self.args,
                 rollout_engines=rollout_engines,
