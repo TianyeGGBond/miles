@@ -217,22 +217,11 @@ def main():
         declared_engine_count,
     )
 
-    # ---- 7-9. Run the async setup-and-loop block. ---------------------------
-    # Wrap set_rollout_manager + base v=-1 sync + loop into a single async
-    # entry so we use exactly one ``asyncio.run`` (avoids dangling event-loop
-    # state between separate runs).
+    # ---- 7. Run the async training loop. ------------------------------------
+    # set_rollout_manager and base v=-1 sync are now driven inside
+    # MilesPipeline._init_phase_b_infer (Phase B steps 4b and 7), so the
+    # driver only needs to start the per-step loop here.
     async def _async_main():
-        # Wire the train group to the rollout manager. Standalone does this
-        # in ``create_training_models``; in RLix mode the pipeline does not.
-        await train_group.set_rollout_manager(rollout_manager)
-
-        # Base v=-1 weight sync to active engines via the coordinator. Phase A
-        # built buckets for step=-1; Phase B registered handles + bootstrapped
-        # the active set. ``ray.get`` blocks the event loop for the duration
-        # of the sync RPC, which is acceptable: nothing else is in flight here.
-        ray.get(coordinator.sync_base_weights_to_active.remote(-1))
-        logger.info("[run_miles_rlix] base v=-1 weight sync complete")
-
         async def _before(step: int) -> None:
             await pipeline.before_training.remote(step)
 

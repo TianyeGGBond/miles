@@ -76,22 +76,80 @@ def _register_miles_admin_routes(sglang_app) -> None:
     if "/update_weights_from_cpu_bucket" in existing_paths:
         return
 
-    async def _route_update_weights_from_cpu_bucket(request):
-        # Lazy import inside the handler so module import order stays
+    # Define the body schema at registration time so FastAPI parses the
+    # JSON body correctly. Without a Pydantic model FastAPI treats the
+    # `request` parameter as a query field and rejects the POST as 400.
+    from pydantic import BaseModel as _BaseModel
+
+    class _UpdateBucketBody(_BaseModel):
+        payload_path: str
+        bucket_index: int = -1
+        sync_id: str = ""
+
+    async def _route_update_weights_from_cpu_bucket(body: _UpdateBucketBody):
+        """Receiver-side F4d loader: read the bucket payload from the
+        sender-written tmpfs file, deserialize the named tensors, and
+        forward to SGLang's tokenizer_manager.update_weights_from_tensor.
+
+        The sender (`SGLangEngine.update_weights_from_cpu_bucket`) writes
+        a torch-pickled ``dict[name, tensor]`` (constructed by
+        `MegatronTrainRayActor._dispatch_cpu_serialize_bucket`) to
+        ``body.payload_path`` and POSTs the body to this route.
+        """
+        # Lazy imports inside the handler so module import order stays
         # robust under multiprocessing spawn.
+        import os as _os
+
+        import torch
         from fastapi.responses import JSONResponse
 
+        from sglang.srt.entrypoints.http_server import _global_state
+        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        payload_path = body.payload_path
+        if not payload_path or not _os.path.exists(payload_path):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": f"payload_path missing or not on disk: {payload_path!r}",
+                },
+            )
+
+        try:
+            named_tensors_dict = torch.load(payload_path, map_location="cpu", weights_only=True)
+        except Exception:
+            # Fall back if the torch version requires weights_only=False.
+            named_tensors_dict = torch.load(payload_path, map_location="cpu")
+
+        named_tensors = [(str(k), v) for k, v in named_tensors_dict.items()]
+        tp_size = int(_global_state.tokenizer_manager.server_args.tp_size)
+        serialized_named_tensors = [
+            MultiprocessingSerializer.serialize(named_tensors) for _ in range(tp_size)
+        ]
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=serialized_named_tensors,
+            load_format=None,
+            flush_cache=True,
+        )
+        try:
+            success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
+                obj, None
+            )
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": f"update_weights_from_tensor: {exc!r}"},
+            )
+
         return JSONResponse(
-            status_code=501,
+            status_code=200 if success else 500,
             content={
-                "status": "not_implemented",
-                "error": (
-                    "F4d cpu_serialize loader is wired in iter 19/20 by "
-                    "MilesModelUpdateService; iter 13 only registers the "
-                    "route surface. Calling this route at this milestone "
-                    "is a misconfiguration — the upstream sync should not "
-                    "reach the receiver yet."
-                ),
+                "success": bool(success),
+                "message": str(message),
+                "bucket_index": int(body.bucket_index),
+                "sync_id": str(body.sync_id),
             },
         )
 

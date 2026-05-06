@@ -86,27 +86,34 @@ async def run_async_train_loop(
     if num_rollout <= start_rollout_id:
         return
 
+    import logging as _logging
+
+    _log = _logging.getLogger("rlix_train_loop")
+    _log.setLevel(_logging.INFO)
+
     # Pre-loop priming: dispatch the first rollout. The base v=-1 weight
     # sync MUST already have been driven by the caller (driver) so this
     # rollout sees correctly-versioned weights.
+    _log.info("[loop] pre-loop generate dispatch rollout_id=%d", start_rollout_id)
     rollout_data_next_future = rollout_manager.generate.remote(start_rollout_id)
 
     for rollout_id in range(start_rollout_id, num_rollout):
-        # 1) Sync the rollout dispatched by the previous iter (or by the
-        #    pre-loop priming for the first iter).
+        _log.info("[loop] rollout_id=%d step1: await rollout_data start", rollout_id)
         rollout_data_curr_ref = await rollout_data_next_future
         rollout_data_next_future = None
+        _log.info("[loop] rollout_id=%d step1: await rollout_data done", rollout_id)
 
-        # 2) before_step — claim actor_train, onload train weights.
+        _log.info("[loop] rollout_id=%d step2: before_step start", rollout_id)
         await before_step(rollout_id)
+        _log.info("[loop] rollout_id=%d step2: before_step done", rollout_id)
 
-        # 3) Training step. ``train_group.train`` broadcasts to every
-        #    actor in the train group.
+        _log.info("[loop] rollout_id=%d step3: train_group.train start", rollout_id)
         await train_group.train(rollout_id, rollout_data_curr_ref)
+        _log.info("[loop] rollout_id=%d step3: train_group.train done", rollout_id)
 
-        # 4) after_step — build cpu bucket cache, offload, sync to
-        #    active engines via the coordinator, release actor_train.
+        _log.info("[loop] rollout_id=%d step4: after_step start", rollout_id)
         await after_step(rollout_id)
+        _log.info("[loop] rollout_id=%d step4: after_step done", rollout_id)
 
         # 5) Optional save (gated; smoke disables via --save "").
         if getattr(args, "save", None):
