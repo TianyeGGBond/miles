@@ -909,6 +909,27 @@ class RolloutManager:
                 raise RuntimeError(
                     f"shrink_engines drain timeout after 30s; still busy: {still_busy}"
                 )
+            # Step 3.5 (rlix-mode safety): pause the SGLang scheduler with
+            # mode="retract" before release_memory_occupation, so any
+            # in-flight Triton kernel (e.g. write_req_to_token_pool_triton
+            # launched for the last decode iteration) finishes against
+            # GPU-resident persistent buffers before release moves them
+            # to CPU. Without this, SGLang crashes with ``Pointer
+            # argument cannot be accessed from Triton (cpu tensor?)``
+            # because release_memory_occupation moves persistent
+            # token-pool buffers to CPU mid-iteration. The pause API
+            # blocks until the scheduler reaches a safe checkpoint.
+            if os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+                try:
+                    ray.get([h.pause_generation.remote(mode="retract") for h in handles])
+                except Exception as exc:  # noqa: BLE001
+                    # pause_generation is a best-effort barrier — if SGLang
+                    # rejects the request (e.g. already paused), continue
+                    # on to flush+release rather than blocking the loop.
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        "shrink_engines: pause_generation pre-release failed: %r", exc
+                    )
             # Step 4: release memory.
             ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
             # Step 5: optional post-sleep VRAM assert.
@@ -1584,6 +1605,18 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
 
             group_abs_start = rollout_pg_offset + gpu_offset
             needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
+            # rlix-mode override: miles' static rollout_pg_offset model
+            # places engines after the train pool (group_abs_start ≥
+            # megatron_num_gpus → needs_offload=False), but rlix's
+            # cluster_device_mappings can map engines onto the same
+            # physical GPUs as train (partial overlap). When the rlix
+            # scheduler resizes infer to free overlap GPUs for
+            # actor_train, SGLang's release_memory_occupation must
+            # actually return memory to the OS — which requires
+            # enable_memory_saver=True. Force it on under rlix when
+            # offload_rollout is set.
+            if args.offload_rollout and os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+                needs_offload = True
             overrides = dict(group_cfg.overrides)
             if args.offload_rollout and not needs_offload:
                 overrides.setdefault("enable_memory_saver", False)
