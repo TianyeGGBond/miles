@@ -51,45 +51,38 @@ if os.environ.get("RLIX_CONTROL_PLANE") != "rlix":
     sys.exit(2)
 
 
-def _split_devices(physical_gpus: list[int]) -> tuple[list[int], list[int]]:
-    """Split a contiguous physical GPU range into two disjoint halves.
+def _split_pools_for_dual(
+    *, num_gpus_per_node: int, infer_pool_size: int
+) -> tuple[list[int], list[int]]:
+    """Split a contiguous physical GPU pool into two disjoint per-pipeline pools.
 
-    For a 4-GPU machine returns ``([0,1], [2,3])`` — the canonical
-    M11.2 Option A topology Codex recommended.
+    For a 4-GPU machine with infer_pool_size=2 returns
+    ``([0,1], [2,3])``. The base args carry the PER-PIPELINE shape
+    (actor_num_gpus_per_node = train size per pipeline,
+    rollout_num_gpus = infer pool size per pipeline). The dual driver
+    just maps each pipeline onto its own slice of the physical pool.
     """
-    if len(physical_gpus) % 2 != 0:
+    needed = 2 * infer_pool_size
+    if num_gpus_per_node < needed:
         raise ValueError(
-            f"physical_gpus must be even-length for two pipelines; got {physical_gpus}"
+            f"need {needed} GPUs for 2 pipelines (each infer_pool={infer_pool_size}), "
+            f"have num_gpus_per_node={num_gpus_per_node}"
         )
-    half = len(physical_gpus) // 2
-    return list(physical_gpus[:half]), list(physical_gpus[half:])
+    physical = list(range(num_gpus_per_node))
+    return list(physical[:infer_pool_size]), list(physical[infer_pool_size : 2 * infer_pool_size])
 
 
-def _per_pipeline_args(base_args, *, pipeline_index: int, gpu_pool: list[int]):
+def _per_pipeline_args(base_args, *, pipeline_index: int):
     """Deep-copy parsed args and tailor for one pipeline.
 
-    Each pipeline gets:
-    - Its own actor_num_gpus_per_node = len(gpu_pool)
-    - rollout_num_gpus = len(gpu_pool) (matches actor pool size for
-      Option A disjoint pools)
-    - exp_name suffix mp{pipeline_index} for trackability
-    - sglang_router_port unset so each pipeline auto-allocates
+    BASE args already carry the per-pipeline topology shape
+    (actor_num_gpus_per_node = per-pipeline train size,
+    rollout_num_gpus = per-pipeline infer pool size). This function only
+    bumps exp_name and resets the router port so each pipeline gets a
+    fresh allocation.
     """
     args = copy.deepcopy(base_args)
 
-    # actor_num_nodes stays 1 (single-node smoke); per-pipeline GPU
-    # count comes from the pool size.
-    args.actor_num_gpus_per_node = len(gpu_pool)
-    # actor_num_nodes already 1; leave alone.
-
-    # Rollout pool also has len(gpu_pool) GPUs (Option A: train ⊆ infer
-    # within the per-pipeline pool, fully overlapping).
-    args.rollout_num_gpus = len(gpu_pool)
-    # rollout_num_gpus_per_engine stays as the user-configured value
-    # (typically 1 for the smoke).
-
-    # exp_name suffix so tracking dirs / wandb names don't collide
-    # (W&B disabled per smoke; this is mostly defensive).
     if hasattr(args, "exp_name") and args.exp_name:
         args.exp_name = f"{args.exp_name}-mp{pipeline_index}"
     else:
@@ -97,8 +90,7 @@ def _per_pipeline_args(base_args, *, pipeline_index: int, gpu_pool: list[int]):
 
     # Force fresh router allocation per pipeline; rollout.py's
     # _start_router calls find_available_port when sglang_router_port is
-    # None, and uses different random ranges (3000–4000) so the two
-    # pipelines auto-pick distinct ports.
+    # None.
     if hasattr(args, "sglang_router_port"):
         args.sglang_router_port = None
 
@@ -109,7 +101,7 @@ def _build_pipeline(
     *,
     base_args,
     pipeline_index: int,
-    gpu_pool: list[int],
+    pipeline_pool: list[int],
     orchestrator,
     ray,
     MilesCoordinator,
@@ -120,22 +112,42 @@ def _build_pipeline(
 ):
     """Allocate one pipeline_id, register, admit, create coordinator+pipeline.
 
+    ``pipeline_pool`` is the disjoint slice of physical GPUs for THIS
+    pipeline. Within that pool we keep the partial-overlap shape from
+    base_args: train pool = first ``actor_num_gpus_per_node`` GPUs of
+    the pipeline pool, infer pool = full pipeline pool.
+
     Returns ``(pipeline_id, namespace, coordinator_handle, pipeline_handle, args)``.
     """
     pipeline_id = ray.get(orchestrator.allocate_pipeline_id.remote("miles"))
     pipeline_namespace = get_pipeline_namespace(pipeline_id)
-    logger.info(
-        "[run_miles_dual] mp%d allocated pipeline_id=%s namespace=%s gpu_pool=%s",
-        pipeline_index, pipeline_id, pipeline_namespace, gpu_pool,
-    )
 
-    args = _per_pipeline_args(
-        base_args, pipeline_index=pipeline_index, gpu_pool=gpu_pool
+    args = _per_pipeline_args(base_args, pipeline_index=pipeline_index)
+
+    train_size = int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node)
+    infer_size = int(args.rollout_num_gpus)
+    if infer_size != len(pipeline_pool):
+        raise ValueError(
+            f"mp{pipeline_index}: pipeline_pool size {len(pipeline_pool)} != "
+            f"args.rollout_num_gpus {infer_size}"
+        )
+    if train_size > infer_size:
+        raise ValueError(
+            f"mp{pipeline_index}: train_size {train_size} > infer_size {infer_size}; "
+            f"per-pipeline must keep partial-overlap (train ⊆ infer)"
+        )
+    train_mapping = list(pipeline_pool[:train_size])
+    infer_mapping = list(pipeline_pool)
+    logger.info(
+        "[run_miles_dual] mp%d allocated pipeline_id=%s namespace=%s "
+        "train=%s infer=%s",
+        pipeline_index, pipeline_id, pipeline_namespace,
+        train_mapping, infer_mapping,
     )
 
     cluster_device_mappings = {
-        "actor_train": list(gpu_pool),
-        "actor_infer": list(gpu_pool),
+        "actor_train": train_mapping,
+        "actor_infer": infer_mapping,
     }
     cluster_tp_configs = {
         "actor_train": int(args.actor_num_gpus_per_node),
@@ -256,16 +268,26 @@ def main():
         cluster_device_mappings: dict = field(default_factory=dict)
 
     # --- Topology: derive 2-pipeline disjoint pools from physical GPUs ---
-    # Total physical GPUs = actor_num_nodes * actor_num_gpus_per_node on
-    # the BASE args (assumed to be the whole machine pool, e.g. 4xRTX5090).
-    total_gpus = int(base_args.actor_num_nodes) * int(
-        base_args.actor_num_gpus_per_node
+    # BASE args carry the per-pipeline shape (actor_num_gpus_per_node =
+    # per-pipeline train size, rollout_num_gpus = per-pipeline infer
+    # pool size). num_gpus_per_node is the WHOLE-machine GPU count.
+    num_gpus_per_node = int(getattr(base_args, "num_gpus_per_node", 0) or 0)
+    if num_gpus_per_node <= 0:
+        raise RuntimeError(
+            "run_miles_dual.py requires --num-gpus-per-node to set the whole-"
+            "machine GPU count (so the dual driver can split it into 2 "
+            "disjoint per-pipeline pools)."
+        )
+    pool_p1, pool_p2 = _split_pools_for_dual(
+        num_gpus_per_node=num_gpus_per_node,
+        infer_pool_size=int(base_args.rollout_num_gpus),
     )
-    physical = list(range(total_gpus))
-    pool_p1, pool_p2 = _split_devices(physical)
     logger.info(
-        "[run_miles_dual] topology: total_gpus=%d, P1=%s, P2=%s",
-        total_gpus, pool_p1, pool_p2,
+        "[run_miles_dual] topology: num_gpus_per_node=%d, P1_pool=%s, P2_pool=%s, "
+        "per-pipeline train_size=%d infer_size=%d",
+        num_gpus_per_node, pool_p1, pool_p2,
+        int(base_args.actor_num_nodes) * int(base_args.actor_num_gpus_per_node),
+        int(base_args.rollout_num_gpus),
     )
 
     # ---- 1. Connect to RLix; get the orchestrator. -----------------------
@@ -277,7 +299,7 @@ def main():
     p1 = _build_pipeline(
         base_args=base_args,
         pipeline_index=1,
-        gpu_pool=pool_p1,
+        pipeline_pool=pool_p1,
         orchestrator=orchestrator,
         ray=ray,
         MilesCoordinator=MilesCoordinator,
@@ -289,7 +311,7 @@ def main():
     p2 = _build_pipeline(
         base_args=base_args,
         pipeline_index=2,
-        gpu_pool=pool_p2,
+        pipeline_pool=pool_p2,
         orchestrator=orchestrator,
         ray=ray,
         MilesCoordinator=MilesCoordinator,
