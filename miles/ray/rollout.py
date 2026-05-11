@@ -602,13 +602,24 @@ class RolloutManager:
         """
         srv = self._get_updatable_server()
         engines = list(srv.engines) if srv else []
+        # M11.2 Option β: when MILES_INIT_DEFER_ADD_WORKER=1, engines were
+        # constructed without /add_worker; land them in "loading" state so
+        # MilesPipeline.initialize_pipeline can drive finish_init_offload
+        # (rollout.py:1009-1034 — requires state=="loading") to bring them
+        # to "offloaded" with VRAM released. F40 Runtime branch then handles
+        # wake → sync → activate_routing on first _expand_workers.
+        init_state = (
+            "loading"
+            if os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1"
+            else "active"
+        )
         for idx, handle in enumerate(engines):
             if handle is None:
                 self._engines[idx] = EngineInfo(engine_index=idx, state="shell", handle=None)
                 continue
             self._engines[idx] = EngineInfo(
                 engine_index=idx,
-                state="active",
+                state=init_state,
                 handle=handle,
             )
 
@@ -869,6 +880,24 @@ class RolloutManager:
         # so callers document intent.
         self._release_abort_idempotency_for(engine_indices)
 
+    def get_router_enabled_workers(self) -> list[str]:
+        """M11.2 Option β 3e: snapshot the router's ``enabled_workers`` set.
+
+        ``MilesPipeline._init_phase_b_infer`` asserts this returns an
+        empty list at the end of Phase B INIT when running with
+        ``MILES_INIT_DEFER_ADD_WORKER=1`` (Codex KT review Q5-a).
+        """
+        srv = self._get_updatable_server()
+        router = getattr(srv, "router", None) if srv is not None else None
+        if router is None:
+            return []
+        # `router.enabled_workers` is a set of URLs maintained as the
+        # source of truth for the live worker set (router.py:497).
+        try:
+            return sorted(router.enabled_workers)
+        except AttributeError:
+            return []
+
     def shrink_engines(
         self,
         engine_indices: Iterable[int],
@@ -897,6 +926,23 @@ class RolloutManager:
         for idx in indices:
             if self._engines[idx].state == "active":
                 self._engines[idx].state = "disabling"
+        # M11.2 Option β 3f (Codex KT review Q5-b + Phase 3 review HIGH):
+        # close router admission BEFORE memory release. Under
+        # MILES_INIT_DEFER_ADD_WORKER=1 the router is the single source
+        # of truth for live workers; calling /disable_worker first
+        # guarantees no new request is dispatched to an engine whose VRAM
+        # is about to drop. unregister_from_router raises on non-2xx,
+        # propagating into the outer try/except (L967-971) which resets
+        # the abort idempotency cache and re-raises — so the manager
+        # never frees GPU memory on a router that hasn't closed admission.
+        handles = [self._engines[idx].handle for idx in indices]
+        ray.get([h.unregister_from_router.remote() for h in handles])
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "[RolloutManager] shrink_engines: disabled router workers "
+            "prior to release engine_indices=%s",
+            indices,
+        )
         # Steps 2-5 are wrapped so a mid-sequence failure resets the abort
         # idempotency cache — otherwise retry's _abort_engines would skip
         # the already-cached indices and the drain would re-stall.
@@ -1034,11 +1080,18 @@ class RolloutManager:
         return indices
 
     def activate_routing(self, engine_indices: Iterable[int]) -> list[int]:
-        """``loading → active`` transition; called by coordinator AFTER sync.
+        """``loading → active`` transition + router /add_worker (M11.2 Option β).
 
-        Iter 5 only updates manager-side state. The router-side admission
-        (``router.add_worker`` with ``engine_index=...``) is wired in iters
-        7–8 + 23 (coordinator orchestrates both manager and router).
+        Iter 5 only updated manager-side state and assumed engines had
+        already registered with the router at ``_init_normal``. Under
+        ``MILES_INIT_DEFER_ADD_WORKER=1`` (real M11.2 overlap mode) that
+        register was skipped so the engine could initialize with empty
+        router state; ``activate_routing`` now drives the just-in-time
+        register via ``SGLangEngine.register_with_router``. Standalone
+        miles also calls register_with_router — idempotent at the router
+        (`_add_worker_internal` discards from ``dead_workers`` on re-add)
+        and keeps router state aligned with manager state on every
+        ``F40 Runtime`` expand cycle.
         """
         indices = sorted(set(int(i) for i in engine_indices))
         for idx in indices:
@@ -1050,6 +1103,20 @@ class RolloutManager:
                     f"activate_routing requires state=='loading'; engine_index "
                     f"{idx} is {info.state!r}"
                 )
+        # Codex Phase 3 review MEDIUM: register_with_router raises on
+        # non-2xx so we never mark engines "active" against a router
+        # that doesn't know about them. The exception propagates up to
+        # the coordinator's F40 Runtime branch which can retry or fail
+        # the expand cycle.
+        handles = [self._engines[idx].handle for idx in indices]
+        ray.get([h.register_with_router.remote() for h in handles])
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "[RolloutManager] activate_routing: registered router workers "
+            "engine_indices=%s",
+            indices,
+        )
+        for idx in indices:
             self._engines[idx].state = "active"
         return indices
 

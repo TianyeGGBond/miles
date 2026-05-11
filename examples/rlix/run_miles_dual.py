@@ -61,6 +61,9 @@ def _split_pools_for_dual(
     (actor_num_gpus_per_node = train size per pipeline,
     rollout_num_gpus = infer pool size per pipeline). The dual driver
     just maps each pipeline onto its own slice of the physical pool.
+
+    M11.2-DISJOINT fallback only. Real M11.2 (overlap) uses
+    ``_overlap_pools_from_env`` below.
     """
     needed = 2 * infer_pool_size
     if num_gpus_per_node < needed:
@@ -72,14 +75,83 @@ def _split_pools_for_dual(
     return list(physical[:infer_pool_size]), list(physical[infer_pool_size : 2 * infer_pool_size])
 
 
-def _per_pipeline_args(base_args, *, pipeline_index: int):
+def _parse_gpu_list(env_name: str) -> list[int] | None:
+    """Parse ``MILES_DUAL_*`` env (comma-separated GPU IDs) into a list.
+
+    Returns ``None`` if the env is unset / empty so callers can fall
+    back to the disjoint default.
+    """
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return None
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip() != ""]
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_name}={raw!r} is not a comma-separated list of GPU IDs"
+        ) from exc
+
+
+def _overlap_pools_from_env(num_gpus_per_node: int) -> (
+    tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]] | None
+):
+    """Read per-pipeline mappings from ``MILES_DUAL_*`` env vars.
+
+    Returns ``((p1_train, p1_infer), (p2_train, p2_infer))`` if **all four**
+    env vars are set; otherwise ``None`` (caller falls back to
+    ``_split_pools_for_dual``). Validates:
+      - each GPU id is in ``[0, num_gpus_per_node)``
+      - per-pipeline ``train ⊆ infer`` (partial-overlap inside pipeline)
+      - no duplicate IDs within a single mapping
+    Cross-pipeline overlap is INTENDED for real M11.2 and is NOT rejected
+    here; the harness ``grep_overlap_log.sh`` asserts the overlap-non-empty
+    condition end-to-end.
+    """
+    p1_train = _parse_gpu_list("MILES_DUAL_P1_TRAIN")
+    p1_infer = _parse_gpu_list("MILES_DUAL_P1_INFER")
+    p2_train = _parse_gpu_list("MILES_DUAL_P2_TRAIN")
+    p2_infer = _parse_gpu_list("MILES_DUAL_P2_INFER")
+    if None in (p1_train, p1_infer, p2_train, p2_infer):
+        return None
+    for label, mapping in (
+        ("p1_train", p1_train), ("p1_infer", p1_infer),
+        ("p2_train", p2_train), ("p2_infer", p2_infer),
+    ):
+        for g in mapping:
+            if g < 0 or g >= num_gpus_per_node:
+                raise ValueError(
+                    f"{label}={mapping} contains GPU {g} outside "
+                    f"[0, {num_gpus_per_node})"
+                )
+        if len(set(mapping)) != len(mapping):
+            raise ValueError(f"{label}={mapping} has duplicate GPU ids")
+    if not set(p1_train).issubset(set(p1_infer)):
+        raise ValueError(
+            f"p1_train={p1_train} not ⊆ p1_infer={p1_infer} "
+            f"(per-pipeline partial-overlap invariant)"
+        )
+    if not set(p2_train).issubset(set(p2_infer)):
+        raise ValueError(
+            f"p2_train={p2_train} not ⊆ p2_infer={p2_infer} "
+            f"(per-pipeline partial-overlap invariant)"
+        )
+    return (p1_train, p1_infer), (p2_train, p2_infer)
+
+
+def _per_pipeline_args(
+    base_args,
+    *,
+    pipeline_index: int,
+    train_size: int | None = None,
+    infer_size: int | None = None,
+):
     """Deep-copy parsed args and tailor for one pipeline.
 
-    BASE args already carry the per-pipeline topology shape
-    (actor_num_gpus_per_node = per-pipeline train size,
-    rollout_num_gpus = per-pipeline infer pool size). This function only
-    bumps exp_name and resets the router port so each pipeline gets a
-    fresh allocation.
+    When ``train_size`` / ``infer_size`` are provided, the per-pipeline
+    ``actor_num_gpus_per_node`` (assuming ``actor_num_nodes=1``) and
+    ``rollout_num_gpus`` are overridden so MilesPipeline's placement
+    provider sees the right sizes. When omitted, base args' per-pipeline
+    shape is preserved (M11.2-disjoint fallback behavior).
     """
     args = copy.deepcopy(base_args)
 
@@ -94,6 +166,19 @@ def _per_pipeline_args(base_args, *, pipeline_index: int):
     if hasattr(args, "sglang_router_port"):
         args.sglang_router_port = None
 
+    # M11.2-OVERLAP: per-pipeline shape derived from explicit mappings.
+    # Assumes actor_num_nodes=1 (single-machine; multi-node deferred to
+    # M11.3+). The whole-machine num_gpus_per_node stays as base.
+    if train_size is not None:
+        if int(getattr(args, "actor_num_nodes", 1)) != 1:
+            raise NotImplementedError(
+                "run_miles_dual.py overlap mode requires actor_num_nodes=1 "
+                "(multi-node deferred to M11.3+)"
+            )
+        args.actor_num_gpus_per_node = int(train_size)
+    if infer_size is not None:
+        args.rollout_num_gpus = int(infer_size)
+
     return args
 
 
@@ -101,7 +186,8 @@ def _build_pipeline(
     *,
     base_args,
     pipeline_index: int,
-    pipeline_pool: list[int],
+    train_mapping: list[int],
+    infer_mapping: list[int],
     orchestrator,
     ray,
     MilesCoordinator,
@@ -112,32 +198,30 @@ def _build_pipeline(
 ):
     """Allocate one pipeline_id, register, admit, create coordinator+pipeline.
 
-    ``pipeline_pool`` is the disjoint slice of physical GPUs for THIS
-    pipeline. Within that pool we keep the partial-overlap shape from
-    base_args: train pool = first ``actor_num_gpus_per_node`` GPUs of
-    the pipeline pool, infer pool = full pipeline pool.
+    ``train_mapping`` / ``infer_mapping`` are the EXPLICIT physical GPU
+    IDs for this pipeline. Overlap with the peer pipeline is allowed
+    (and required for real M11.2). The per-pipeline ``train ⊆ infer``
+    partial-overlap invariant is asserted; cross-pipeline overlap is
+    asserted by ``grep_overlap_log.sh`` end-to-end.
 
     Returns ``(pipeline_id, namespace, coordinator_handle, pipeline_handle, args)``.
     """
     pipeline_id = ray.get(orchestrator.allocate_pipeline_id.remote("miles"))
     pipeline_namespace = get_pipeline_namespace(pipeline_id)
 
-    args = _per_pipeline_args(base_args, pipeline_index=pipeline_index)
-
-    train_size = int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node)
-    infer_size = int(args.rollout_num_gpus)
-    if infer_size != len(pipeline_pool):
+    train_size = len(train_mapping)
+    infer_size = len(infer_mapping)
+    if not set(train_mapping).issubset(set(infer_mapping)):
         raise ValueError(
-            f"mp{pipeline_index}: pipeline_pool size {len(pipeline_pool)} != "
-            f"args.rollout_num_gpus {infer_size}"
+            f"mp{pipeline_index}: train_mapping={train_mapping} not ⊆ "
+            f"infer_mapping={infer_mapping} (per-pipeline partial-overlap)"
         )
-    if train_size > infer_size:
-        raise ValueError(
-            f"mp{pipeline_index}: train_size {train_size} > infer_size {infer_size}; "
-            f"per-pipeline must keep partial-overlap (train ⊆ infer)"
-        )
-    train_mapping = list(pipeline_pool[:train_size])
-    infer_mapping = list(pipeline_pool)
+    args = _per_pipeline_args(
+        base_args,
+        pipeline_index=pipeline_index,
+        train_size=train_size,
+        infer_size=infer_size,
+    )
     logger.info(
         "[run_miles_dual] mp%d allocated pipeline_id=%s namespace=%s "
         "train=%s infer=%s",
@@ -267,27 +351,38 @@ def main():
         # _build_placement_provider can use per-pipeline physical GPUs.
         cluster_device_mappings: dict = field(default_factory=dict)
 
-    # --- Topology: derive 2-pipeline disjoint pools from physical GPUs ---
-    # BASE args carry the per-pipeline shape (actor_num_gpus_per_node =
-    # per-pipeline train size, rollout_num_gpus = per-pipeline infer
-    # pool size). num_gpus_per_node is the WHOLE-machine GPU count.
+    # --- Topology: explicit overlap (env-driven) OR fallback disjoint -----
+    # Real M11.2 path: set MILES_DUAL_P1_TRAIN / P1_INFER / P2_TRAIN / P2_INFER
+    # in the smoke env to drive overlap topology. Fallback (any unset):
+    # _split_pools_for_dual produces disjoint pools sized from base_args.
     num_gpus_per_node = int(getattr(base_args, "num_gpus_per_node", 0) or 0)
     if num_gpus_per_node <= 0:
         raise RuntimeError(
             "run_miles_dual.py requires --num-gpus-per-node to set the whole-"
-            "machine GPU count (so the dual driver can split it into 2 "
-            "disjoint per-pipeline pools)."
+            "machine GPU count."
         )
-    pool_p1, pool_p2 = _split_pools_for_dual(
-        num_gpus_per_node=num_gpus_per_node,
-        infer_pool_size=int(base_args.rollout_num_gpus),
-    )
+    overlap_topology = _overlap_pools_from_env(num_gpus_per_node)
+    if overlap_topology is not None:
+        (p1_train, p1_infer), (p2_train, p2_infer) = overlap_topology
+        topology_mode = "OVERLAP (real M11.2)"
+    else:
+        pool_p1, pool_p2 = _split_pools_for_dual(
+            num_gpus_per_node=num_gpus_per_node,
+            infer_pool_size=int(base_args.rollout_num_gpus),
+        )
+        # Disjoint default: train = first N of pool, infer = full pool
+        train_size = int(base_args.actor_num_nodes) * int(
+            base_args.actor_num_gpus_per_node
+        )
+        p1_train, p1_infer = list(pool_p1[:train_size]), list(pool_p1)
+        p2_train, p2_infer = list(pool_p2[:train_size]), list(pool_p2)
+        topology_mode = "DISJOINT (fallback, Option A)"
+    overlap_shared = sorted(set(p1_infer) & set(p2_infer))
     logger.info(
-        "[run_miles_dual] topology: num_gpus_per_node=%d, P1_pool=%s, P2_pool=%s, "
-        "per-pipeline train_size=%d infer_size=%d",
-        num_gpus_per_node, pool_p1, pool_p2,
-        int(base_args.actor_num_nodes) * int(base_args.actor_num_gpus_per_node),
-        int(base_args.rollout_num_gpus),
+        "[run_miles_dual] topology=%s num_gpus_per_node=%d "
+        "mp1_train=%s mp1_infer=%s mp2_train=%s mp2_infer=%s overlap=%s",
+        topology_mode, num_gpus_per_node,
+        p1_train, p1_infer, p2_train, p2_infer, overlap_shared,
     )
 
     # ---- 1. Connect to RLix; get the orchestrator. -----------------------
@@ -299,7 +394,8 @@ def main():
     p1 = _build_pipeline(
         base_args=base_args,
         pipeline_index=1,
-        pipeline_pool=pool_p1,
+        train_mapping=p1_train,
+        infer_mapping=p1_infer,
         orchestrator=orchestrator,
         ray=ray,
         MilesCoordinator=MilesCoordinator,
@@ -311,7 +407,8 @@ def main():
     p2 = _build_pipeline(
         base_args=base_args,
         pipeline_index=2,
-        pipeline_pool=pool_p2,
+        train_mapping=p2_train,
+        infer_mapping=p2_infer,
         orchestrator=orchestrator,
         ray=ray,
         MilesCoordinator=MilesCoordinator,
@@ -343,12 +440,17 @@ def main():
         async def _after(step: int) -> None:
             await pipe.after_training.remote(step)
 
+        async def _release_only(step: int) -> None:
+            # R04-F1 cleanup hook: releases actor_train allocation only.
+            await pipe.release_train_only.remote(step)
+
         await run_async_train_loop(
             args,
             train_group=train_group,
             rollout_manager=rollout_manager,
             before_step=_before,
             after_step=_after,
+            release_only=_release_only,
         )
         logger.info("[run_miles_dual] mp%d training loop complete pipeline_id=%s", idx, pid)
 

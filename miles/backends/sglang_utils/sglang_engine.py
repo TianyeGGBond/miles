@@ -333,10 +333,26 @@ class SGLangEngine(RayActor):
         _sanity_check_server_args(actual_server_args, expect_server_args)
 
     def _init_normal(self, server_args_dict):
+        import os as _os
+
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
+            # M11.2 Option β: when MILES_INIT_DEFER_ADD_WORKER=1, skip the
+            # router /add_worker POST so engines initialize with empty
+            # router enabled_workers. The coordinator's F40 Runtime expand
+            # (miles_coordinator.py:498-512) calls activate_routing later
+            # which adds workers as engines wake. Standalone miles (no
+            # rlix) leaves the env unset — existing behavior preserved.
+            if _os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1":
+                logger.info(
+                    "[sglang_engine] MILES_INIT_DEFER_ADD_WORKER=1 — skipping "
+                    "router /add_worker at init (Option β / Gate 4(c)) for "
+                    "url=http://%s:%d",
+                    self.server_host, self.server_port,
+                )
+                return
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
                 assert (
                     self.worker_type == "regular"
@@ -356,6 +372,55 @@ class SGLangEngine(RayActor):
                     json=payload,
                 )
             response.raise_for_status()
+
+    def register_with_router(self) -> None:
+        """M11.2 Option β: post /add_worker to the local router on demand.
+
+        Called by ``RolloutManager.activate_routing`` for engines that
+        skipped router registration during ``_init_normal`` (because
+        ``MILES_INIT_DEFER_ADD_WORKER=1`` was set). **Raises** on
+        non-2xx so the caller can abort the wake cycle rather than mark
+        the engine ``active`` against a router that doesn't know about
+        it (Codex Phase 3 review HIGH). Idempotent at the router layer
+        (`_add_worker_internal` discards from ``dead_workers`` on re-add).
+
+        No-op for non-rank-0 / no-router engines (returns silently).
+        """
+        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+            return
+        url = f"http://{self.server_host}:{self.server_port}"
+        r = requests.post(
+            f"http://{self.router_ip}:{self.router_port}/add_worker?url={url}"
+        )
+        r.raise_for_status()
+        logger.info(
+            "[sglang_engine] register_with_router OK url=%s status=%d",
+            url, r.status_code,
+        )
+
+    def unregister_from_router(self) -> None:
+        """M11.2 Option β / 3f: post /disable_worker before memory release.
+
+        Called by ``RolloutManager.shrink_engines`` ahead of
+        ``release_memory_occupation`` so the router admission is closed
+        before VRAM is dropped. **Raises** on non-2xx so the caller
+        aborts the release sequence rather than free GPU memory while
+        the router can still dispatch to this URL (Codex Phase 3 review
+        HIGH).
+
+        No-op for non-rank-0 / no-router engines (returns silently).
+        """
+        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+            return
+        url = f"http://{self.server_host}:{self.server_port}"
+        r = requests.post(
+            f"http://{self.router_ip}:{self.router_port}/disable_worker?url={url}"
+        )
+        r.raise_for_status()
+        logger.info(
+            "[sglang_engine] unregister_from_router OK url=%s status=%d",
+            url, r.status_code,
+        )
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
         """Make a POST request to the specified endpoint with the given payload.

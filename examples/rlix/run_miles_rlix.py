@@ -239,12 +239,17 @@ def main():
         async def _after(step: int) -> None:
             await pipeline.after_training.remote(step)
 
+        async def _release_only(step: int) -> None:
+            # R04-F1 cleanup hook: releases actor_train allocation only.
+            await pipeline.release_train_only.remote(step)
+
         await run_async_train_loop(
             args,
             train_group=train_group,
             rollout_manager=rollout_manager,
             before_step=_before,
             after_step=_after,
+            release_only=_release_only,
         )
 
     asyncio.run(_async_main())

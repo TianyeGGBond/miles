@@ -44,6 +44,7 @@ async def run_async_train_loop(
     rollout_manager: Any,
     before_step: StepHook,
     after_step: StepHook,
+    release_only: Optional[StepHook] = None,
     num_rollout_per_epoch: Optional[int] = None,
 ) -> None:
     """RLix-mode async training loop.
@@ -97,23 +98,95 @@ async def run_async_train_loop(
     _log.info("[loop] pre-loop generate dispatch rollout_id=%d", start_rollout_id)
     rollout_data_next_future = rollout_manager.generate.remote(start_rollout_id)
 
+    import os as _os
+
+    _inject_fault = _os.environ.get("MILES_INJECT_TRAIN_FAULT") == "1"
+
     for rollout_id in range(start_rollout_id, num_rollout):
         _log.info("[loop] rollout_id=%d step1: await rollout_data start", rollout_id)
         rollout_data_curr_ref = await rollout_data_next_future
         rollout_data_next_future = None
         _log.info("[loop] rollout_id=%d step1: await rollout_data done", rollout_id)
 
-        _log.info("[loop] rollout_id=%d step2: before_step start", rollout_id)
-        await before_step(rollout_id)
-        _log.info("[loop] rollout_id=%d step2: before_step done", rollout_id)
+        # R04-F1: bracket BOTH before_step AND train() in try/except so a
+        # failure at any point after the scheduler claim releases the
+        # actor_train allocation via release_only (NOT via after_step,
+        # which builds+publishes a CPU bucket before release and would
+        # crash on un-onloaded weights). Success path is unchanged:
+        # after_step runs end-to-end (cache build → offload → sync →
+        # release). before_step is INSIDE the try because
+        # MilesPipeline._before_training claims actor_train at
+        # miles_pipeline.py:573-578 before any subsequent failure point
+        # (wake_up, free-mem probe, etc.) — without inclusion an exception
+        # there would leak the ledger.
+        train_failed = False
+        try:
+            _log.info(
+                "[loop] rollout_id=%d step2: before_step start", rollout_id
+            )
+            await before_step(rollout_id)
+            _log.info(
+                "[loop] rollout_id=%d step2: before_step done", rollout_id
+            )
 
-        _log.info("[loop] rollout_id=%d step3: train_group.train start", rollout_id)
-        await train_group.train(rollout_id, rollout_data_curr_ref)
-        _log.info("[loop] rollout_id=%d step3: train_group.train done", rollout_id)
-
-        _log.info("[loop] rollout_id=%d step4: after_step start", rollout_id)
-        await after_step(rollout_id)
-        _log.info("[loop] rollout_id=%d step4: after_step done", rollout_id)
+            _log.info(
+                "[loop] rollout_id=%d step3: train_group.train start", rollout_id
+            )
+            if _inject_fault and rollout_id == start_rollout_id:
+                _log.warning(
+                    "[loop] MILES_INJECT_TRAIN_FAULT=1 active — raising before "
+                    "train at rollout_id=%d (R04-F1 verification)",
+                    rollout_id,
+                )
+                raise RuntimeError(
+                    "MILES_INJECT_TRAIN_FAULT=1 — injected failure for "
+                    "R04-F1 vast verification"
+                )
+            await train_group.train(rollout_id, rollout_data_curr_ref)
+            _log.info(
+                "[loop] rollout_id=%d step3: train_group.train done", rollout_id
+            )
+        except BaseException:
+            train_failed = True
+            _log.exception(
+                "[loop] rollout_id=%d step3: train_group.train raised", rollout_id
+            )
+            raise
+        finally:
+            if train_failed:
+                if release_only is not None:
+                    _log.warning(
+                        "[loop] rollout_id=%d cleanup: release_only start "
+                        "(skipping after_step on train failure)",
+                        rollout_id,
+                    )
+                    try:
+                        await release_only(rollout_id)
+                        _log.warning(
+                            "[loop] rollout_id=%d cleanup: release_only done",
+                            rollout_id,
+                        )
+                    except BaseException:
+                        _log.exception(
+                            "[loop] rollout_id=%d cleanup: release_only raised",
+                            rollout_id,
+                        )
+                else:
+                    _log.error(
+                        "[loop] rollout_id=%d cleanup: release_only=None — "
+                        "scheduler actor_train allocation will leak; driver "
+                        "should wire release_only kw to pipeline."
+                        "release_train_only.remote for R04-F1",
+                        rollout_id,
+                    )
+            else:
+                _log.info(
+                    "[loop] rollout_id=%d step4: after_step start", rollout_id
+                )
+                await after_step(rollout_id)
+                _log.info(
+                    "[loop] rollout_id=%d step4: after_step done", rollout_id
+                )
 
         # 5) Optional save (gated; smoke disables via --save "").
         if getattr(args, "save", None):
