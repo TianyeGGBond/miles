@@ -79,8 +79,23 @@ class GenerateFnOutput:
     samples: Sample | list[Sample]
 
 
-def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
-    """Legacy rollout function call interface. Used when MILES_EXPERIMENTAL_ROLLOUT_REFACTOR is disabled."""
+def call_rollout_fn(fn, *args, evaluation: bool, rlix_hooks=None, **kwargs):
+    """Legacy rollout function call interface. Used when MILES_EXPERIMENTAL_ROLLOUT_REFACTOR is disabled.
+
+    ``rlix_hooks``: passed through to the underlying rollout function as a
+    keyword argument when the function accepts it (the canonical
+    ``generate_rollout_fully_async`` and ``generate_rollout_async`` entries
+    do). Without this, the rollout function falls back to
+    :class:`NoOpRLixHooks` and every ``begin_progress_batch`` /
+    ``bump_completed`` call is a silent no-op — the central scheduler then
+    has no demand signal between rollouts, so its gap-ratio planner cannot
+    wake engines for rollout N+1 after rollout N's ``_after_training``.
+    """
+    import inspect as _inspect
+
+    fn_params = _inspect.signature(fn).parameters
+    if rlix_hooks is not None and "rlix_hooks" in fn_params:
+        kwargs = {**kwargs, "rlix_hooks": rlix_hooks}
     output = fn(*args, **kwargs, evaluation=evaluation)
 
     # compatibility for legacy version

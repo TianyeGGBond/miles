@@ -290,6 +290,19 @@ def _build_pipeline(
             namespace=pipeline_namespace,
             lifetime="detached",
             num_cpus=0.01,
+            # Mirror rlix's verified 2-pipeline reference
+            # (examples/start_multi_pipeline_test.py: CoordinatorActor
+            # uses COORDINATOR_MAX_CONCURRENCY). The MILES coordinator
+            # services concurrent RPCs from multiple sources:
+            #   - scheduler.resize_infer (engine wake / shrink)
+            #   - report_progress_from_scheduler (hooks → aggregate → scheduler)
+            #   - sync_base_weights_to_active (driven by _after_training)
+            # With the default max_concurrency=1, report_progress events
+            # queue behind whatever else is in flight. That stalls the
+            # scheduler's view of fresh rollout demand between rollouts,
+            # which the gap-ratio planner needs to fire promptly to wake
+            # engines for rollout N+1.
+            max_concurrency=4,
             runtime_env={"env_vars": pipeline_runtime_env_vars},
         )
         .remote(pipeline_id=pipeline_id, pipeline_config=cfg)

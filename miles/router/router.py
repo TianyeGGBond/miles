@@ -9,6 +9,7 @@ import setproctitle
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from miles.utils.misc import load_function
@@ -202,8 +203,26 @@ class MilesRouter:
                 await asyncio.sleep(5)
 
     async def proxy(self, request: Request, path: str):
-        """Proxy all other requests to the SGLang router"""
-        result = await self.do_proxy(request, path)
+        """Proxy all other requests to the SGLang router.
+
+        ``ClientDisconnect`` raised by ``do_proxy`` is the expected outcome
+        when a worker aborts mid-request after seeing
+        ``miles_admission_disabled=True`` in a prior response — that is the
+        F31 scheduler-preempt redispatch signal. Convert it into a clean
+        499 ("Client Closed Request") with a one-line WARNING so the engine
+        shrink path doesn't spam multi-frame ASGI tracebacks; the in-flight
+        worker counter is already balanced inside ``do_proxy`` so no
+        resource leak ensues.
+        """
+        try:
+            result = await self.do_proxy(request, path)
+        except ClientDisconnect:
+            logger.warning(
+                "[miles-router] proxy: client disconnected before request body "
+                "completed path=%s — treating as expected preempt-redispatch",
+                path,
+            )
+            return Response(status_code=499)
         return self.build_proxy_response(result)
 
     async def do_proxy(
@@ -225,18 +244,26 @@ class MilesRouter:
         body invalidates any prior gzip / deflate content-coding;
         Content-Length is recomputed by build_proxy_response /
         JSONResponse so we drop it here as well.
+
+        Counter balance: ``worker_url`` is acquired BEFORE the
+        ``await request.body()`` call (whose ``ClientDisconnect`` is the
+        common preempt-race symptom), so the ``_finish_url`` decrement must
+        run from the same outer ``try/finally`` that wraps the body read
+        and the upstream request — otherwise the in-flight counter for the
+        affected worker would leak and the LB would treat it as
+        permanently busy.
         """
         worker_url = await self._use_url_async()
-        url = f"{worker_url}/{path}"
-
-        if body is None:
-            body = await request.body()
-        if headers is None:
-            headers = dict(request.headers)
-        if body is not None:
-            headers = {k: v for k, v in headers.items() if k.lower() not in ("content-length", "transfer-encoding")}
-
         try:
+            url = f"{worker_url}/{path}"
+
+            if body is None:
+                body = await request.body()
+            if headers is None:
+                headers = dict(request.headers)
+            if body is not None:
+                headers = {k: v for k, v in headers.items() if k.lower() not in ("content-length", "transfer-encoding")}
+
             response = await self.client.request(request.method, url, content=body, headers=headers)
             content = await response.aread()
             response_headers = dict(response.headers)
