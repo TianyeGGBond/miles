@@ -457,6 +457,18 @@ def main():
             # R04-F1 cleanup hook: releases actor_train allocation only.
             await pipe.release_train_only.remote(step)
 
+        # Per-rollout step_target = rollout_batch_size. See
+        # MilesPipeline.signal_rollout_demand docstring for why pre-signalling
+        # demand to the scheduler is required for 4-GPU 2-pipeline full
+        # cross-overlap (without it, rollout 2+ hangs when both pipelines
+        # release all DP workers between rollouts).
+        _step_target = int(getattr(args, "rollout_batch_size", 0) or 0)
+
+        async def _signal_demand(rollout_id: int) -> None:
+            if _step_target <= 0:
+                return
+            await pipe.signal_rollout_demand.remote(rollout_id, _step_target)
+
         await run_async_train_loop(
             args,
             train_group=train_group,
@@ -464,6 +476,7 @@ def main():
             before_step=_before,
             after_step=_after,
             release_only=_release_only,
+            signal_demand=_signal_demand,
         )
         logger.info("[run_miles_dual] mp%d training loop complete pipeline_id=%s", idx, pid)
 
