@@ -481,24 +481,70 @@ def main():
         logger.info("[run_miles_dual] mp%d training loop complete pipeline_id=%s", idx, pid)
 
     async def _async_main():
-        await asyncio.gather(
-            *(
-                _run_one_pipeline(
-                    i + 1, pid, pipe, args, train_group, rollout_manager
-                )
-                for i, (pid, ns, coord, pipe, args, train_group, rollout_manager)
-                in enumerate(handles)
+        # F4 fix (m11-review.review-report.md §2): use create_task + wait(
+        # FIRST_EXCEPTION) instead of asyncio.gather(...). gather's default
+        # semantics propagate the first exception immediately but DO NOT
+        # cancel peer coroutines — pipeline B's coroutine continues
+        # running orphaned in its Ray actor while the driver tears down.
+        # FIRST_EXCEPTION + explicit cancel forces the peer to settle,
+        # so Phase 1's try/finally inside run_async_train_loop fires
+        # release_only on the CancelledError path and the scheduler
+        # ledger stays consistent.
+        tasks = [
+            asyncio.create_task(
+                _run_one_pipeline(i + 1, pid, pipe, args, train_group, rollout_manager)
             )
-        )
+            for i, (pid, ns, coord, pipe, args, train_group, rollout_manager)
+            in enumerate(handles)
+        ]
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
+            first_exc = None
+            for t in done:
+                if t.exception() is not None:
+                    first_exc = t.exception()
+                    break
+            if first_exc is not None:
+                for t in pending:
+                    t.cancel()
+                # Wait for cancelled tasks to settle so release_only fires
+                # inside each pipeline's run_async_train_loop finally.
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise first_exc
+        finally:
+            # F3 fix (m11-review.review-report.md §2): shutdown_hard MUST
+            # fire regardless of how _async_main exits. The prior code
+            # ran shutdown after asyncio.run returned cleanly, so a driver
+            # crash (mid-loop exception, OOM, KeyboardInterrupt) would
+            # skip cleanup and leak the scheduler ledger. F13 hard
+            # constraint ("no top-level try/except") is preserved — this
+            # try/finally lives INSIDE _async_main and propagates
+            # exceptions; only cleanup is added.
+            #
+            # Construct .remote() refs INSIDE the inner try so a synchronous
+            # actor-handle failure (e.g. already-killed actor) is caught
+            # by the except clause below, not propagated to mask the
+            # original training exception. Codex Phase 7 review MEDIUM.
+            try:
+                shutdown_refs = [
+                    pipe.shutdown_hard.remote() for _, _, _, pipe, _, _, _ in handles
+                ]
+                ray.get(shutdown_refs, timeout=60.0)
+                for pid, _, _, _, _, _, _ in handles:
+                    logger.info(
+                        "[run_miles_dual] shutdown_hard complete pipeline_id=%s",
+                        pid,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[run_miles_dual] shutdown_hard during cleanup failed: %r",
+                    exc,
+                )
 
     asyncio.run(_async_main())
     logger.info("[run_miles_dual] both training loops complete; shutting down")
-
-    # ---- 5. Clean shutdown of both pipelines. ----------------------------
-    shutdown_refs = [pipe.shutdown_hard.remote() for _, _, _, pipe, _, _, _ in handles]
-    ray.get(shutdown_refs)
-    for pid, _, _, _, _, _, _ in handles:
-        logger.info("[run_miles_dual] shutdown_hard complete pipeline_id=%s", pid)
 
 
 if __name__ == "__main__":

@@ -243,24 +243,41 @@ def main():
             # R04-F1 cleanup hook: releases actor_train allocation only.
             await pipeline.release_train_only.remote(step)
 
-        await run_async_train_loop(
-            args,
-            train_group=train_group,
-            rollout_manager=rollout_manager,
-            before_step=_before,
-            after_step=_after,
-            release_only=_release_only,
-        )
+        try:
+            await run_async_train_loop(
+                args,
+                train_group=train_group,
+                rollout_manager=rollout_manager,
+                before_step=_before,
+                after_step=_after,
+                release_only=_release_only,
+            )
+            logger.info(
+                "[run_miles_rlix] training loop complete pipeline_id=%s",
+                pipeline_id,
+            )
+        finally:
+            # F3 fix (m11-review.review-report.md §2): shutdown_hard MUST
+            # fire regardless of how _async_main exits. The prior code
+            # ran shutdown only on the success path; a mid-loop crash
+            # (OOM, KeyboardInterrupt) would skip cleanup and leak the
+            # scheduler ledger. F13 hard constraint ("no top-level
+            # try/except") is preserved — this try/finally lives INSIDE
+            # _async_main and propagates exceptions; only cleanup is
+            # added.
+            try:
+                ray.get(pipeline.shutdown_hard.remote(), timeout=60.0)
+                logger.info(
+                    "[run_miles_rlix] shutdown_hard complete pipeline_id=%s — exiting",
+                    pipeline_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[run_miles_rlix] shutdown_hard during cleanup failed pipeline_id=%s: %r",
+                    pipeline_id, exc,
+                )
 
     asyncio.run(_async_main())
-    logger.info("[run_miles_rlix] training loop complete pipeline_id=%s", pipeline_id)
-
-    # ---- 10. Clean shutdown via the pipeline actor. -------------------------
-    ray.get(pipeline.shutdown_hard.remote())
-    logger.info(
-        "[run_miles_rlix] shutdown_hard complete pipeline_id=%s — exiting",
-        pipeline_id,
-    )
 
 
 if __name__ == "__main__":
