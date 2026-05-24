@@ -45,6 +45,7 @@ async def run_async_train_loop(
     before_step: StepHook,
     after_step: StepHook,
     release_only: Optional[StepHook] = None,
+    signal_demand: Optional[StepHook] = None,
     num_rollout_per_epoch: Optional[int] = None,
 ) -> None:
     """RLix-mode async training loop.
@@ -95,6 +96,17 @@ async def run_async_train_loop(
     # Pre-loop priming: dispatch the first rollout. The base v=-1 weight
     # sync MUST already have been driven by the caller (driver) so this
     # rollout sees correctly-versioned weights.
+    #
+    # Pre-signal scheduler demand BEFORE the dispatch so the gap-ratio
+    # planner can wake actor_infer engines without waiting for the
+    # rollout function's first ``begin_progress_batch`` to fire (which
+    # is too late under cross-pipeline contention — see
+    # MilesPipeline.signal_rollout_demand docstring).
+    if signal_demand is not None:
+        _log.info(
+            "[loop] pre-loop signal_demand rollout_id=%d", start_rollout_id
+        )
+        await signal_demand(start_rollout_id)
     _log.info("[loop] pre-loop generate dispatch rollout_id=%d", start_rollout_id)
     rollout_data_next_future = rollout_manager.generate.remote(start_rollout_id)
 
@@ -214,6 +226,16 @@ async def run_async_train_loop(
         # 7) Dispatch the next rollout AFTER actor_train is released, so
         #    the new rollout does not race for partial-overlap GPUs.
         if rollout_id + 1 < num_rollout:
+            # Pre-signal scheduler demand for the next rollout BEFORE
+            # dispatching it (root-cause fix for rollout-2+ hang under
+            # 4-GPU 2-pipeline cross-overlap — see
+            # MilesPipeline.signal_rollout_demand docstring).
+            if signal_demand is not None:
+                _log.info(
+                    "[loop] rollout_id=%d step5: signal_demand for next rollout_id=%d",
+                    rollout_id, rollout_id + 1,
+                )
+                await signal_demand(rollout_id + 1)
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
 

@@ -430,6 +430,13 @@ class RolloutManager:
         self._active_engine_indices: frozenset[int] = (
             frozenset(active_engine_indices) if active_engine_indices is not None else frozenset()
         )
+        # RLix-mode progress hook. Standalone miles leaves this as ``None``
+        # and the rollout function falls back to :class:`NoOpRLixHooks`.
+        # In RLix mode the pipeline driver injects a :class:`MilesRLixHooks`
+        # via :meth:`set_rlix_hooks` so the scheduler receives
+        # ``begin_progress_batch`` / ``bump_completed`` events and can wake
+        # engines for the next rollout after each ``_after_training``.
+        self._rlix_hooks = None
         # TODO make args immutable
         init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
 
@@ -758,6 +765,25 @@ class RolloutManager:
         the consistency assert "scheduler engine_count == declared engine_count".
         """
         return len(self._engines)
+
+    def set_rlix_hooks(self, hooks) -> None:
+        """Inject an RLix progress hook for downstream rollout calls.
+
+        Called by ``MilesPipeline._init_phase_b_infer`` after the manager is
+        created but before the first rollout dispatch. ``hooks`` must
+        implement the :class:`miles.utils.rlix_hooks.RLixHooks` protocol —
+        in production this is :class:`rlix.pipeline.miles_hooks.MilesRLixHooks`
+        wrapping the per-pipeline coordinator handle, so the scheduler
+        receives ``begin_progress_batch`` / ``bump_completed`` events for
+        every rollout and can wake engines for rollout N+1 after the prior
+        ``_after_training`` released ``actor_train``.
+
+        Standalone miles never calls this; ``self._rlix_hooks`` stays
+        ``None`` and :func:`call_rollout_fn` lets the rollout fn fall back
+        to :class:`NoOpRLixHooks`.
+        """
+        self._rlix_hooks = hooks
+        logger.info("[RolloutManager] set_rlix_hooks installed (kind=%s)", type(hooks).__name__)
 
     def get_engine_handles(self, engine_indices: Iterable[int]) -> dict[int, Any]:
         """Read-only snapshot of per-engine handles for the given indices.
@@ -1212,7 +1238,12 @@ class RolloutManager:
                 data = call_rollout_function(self.generate_rollout, RolloutFnTrainInput(rollout_id=rollout_id))
             else:
                 data = call_rollout_fn(
-                    self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
+                    self.generate_rollout,
+                    self.args,
+                    rollout_id,
+                    self.data_source,
+                    evaluation=False,
+                    rlix_hooks=self._rlix_hooks,
                 )
             metrics = data.metrics
             data = data.samples

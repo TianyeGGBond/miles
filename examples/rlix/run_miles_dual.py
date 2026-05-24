@@ -290,6 +290,19 @@ def _build_pipeline(
             namespace=pipeline_namespace,
             lifetime="detached",
             num_cpus=0.01,
+            # Mirror rlix's verified 2-pipeline reference
+            # (examples/start_multi_pipeline_test.py: CoordinatorActor
+            # uses COORDINATOR_MAX_CONCURRENCY). The MILES coordinator
+            # services concurrent RPCs from multiple sources:
+            #   - scheduler.resize_infer (engine wake / shrink)
+            #   - report_progress_from_scheduler (hooks → aggregate → scheduler)
+            #   - sync_base_weights_to_active (driven by _after_training)
+            # With the default max_concurrency=1, report_progress events
+            # queue behind whatever else is in flight. That stalls the
+            # scheduler's view of fresh rollout demand between rollouts,
+            # which the gap-ratio planner needs to fire promptly to wake
+            # engines for rollout N+1.
+            max_concurrency=4,
             runtime_env={"env_vars": pipeline_runtime_env_vars},
         )
         .remote(pipeline_id=pipeline_id, pipeline_config=cfg)
@@ -444,6 +457,18 @@ def main():
             # R04-F1 cleanup hook: releases actor_train allocation only.
             await pipe.release_train_only.remote(step)
 
+        # Per-rollout step_target = rollout_batch_size. See
+        # MilesPipeline.signal_rollout_demand docstring for why pre-signalling
+        # demand to the scheduler is required for 4-GPU 2-pipeline full
+        # cross-overlap (without it, rollout 2+ hangs when both pipelines
+        # release all DP workers between rollouts).
+        _step_target = int(getattr(args, "rollout_batch_size", 0) or 0)
+
+        async def _signal_demand(rollout_id: int) -> None:
+            if _step_target <= 0:
+                return
+            await pipe.signal_rollout_demand.remote(rollout_id, _step_target)
+
         await run_async_train_loop(
             args,
             train_group=train_group,
@@ -451,6 +476,7 @@ def main():
             before_step=_before,
             after_step=_after,
             release_only=_release_only,
+            signal_demand=_signal_demand,
         )
         logger.info("[run_miles_dual] mp%d training loop complete pipeline_id=%s", idx, pid)
 
