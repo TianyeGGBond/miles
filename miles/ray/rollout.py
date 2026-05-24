@@ -1001,15 +1001,33 @@ class RolloutManager:
             # token-pool buffers to CPU mid-iteration. The pause API
             # blocks until the scheduler reaches a safe checkpoint.
             if os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+                # F7 (m11-review.review-report.md §2): documented SGLang
+                # /pause_generation API contract:
+                #   - mode="retract" — waits until the SGLang scheduler reaches
+                #     a safe checkpoint (no in-flight Triton kernels referencing
+                #     persistent token-pool buffers); then halts new batch
+                #     dispatch. The scheduler thread keeps running but does not
+                #     spawn new work.
+                #   - Idempotent (documented intent per the prior comment
+                #     "if SGLang rejects the request e.g. already paused";
+                #     NOT empirically verified across all sglang versions).
+                #   - 4xx ONLY on misuse (unknown mode, missing engine). 5xx
+                #     means SGLang internal error — caller should escalate
+                #     (current path swallows; future M11.5 hardening should
+                #     differentiate 4xx vs 5xx).
+                # Caught Exception is intentionally broad here because the
+                # release sequence MUST continue: without release, the
+                # scheduler ledger leaks. We log at WARNING; the post-sleep
+                # VRAM assert (step 5) will catch any actual memory leak.
                 try:
                     ray.get([h.pause_generation.remote(mode="retract") for h in handles])
                 except Exception as exc:  # noqa: BLE001
-                    # pause_generation is a best-effort barrier — if SGLang
-                    # rejects the request (e.g. already paused), continue
-                    # on to flush+release rather than blocking the loop.
                     import logging as _lg
                     _lg.getLogger(__name__).warning(
-                        "shrink_engines: pause_generation pre-release failed: %r", exc
+                        "shrink_engines: pause_generation pre-release failed "
+                        "(engine_indices=%s, swallowing to keep release path "
+                        "unblocked; post-sleep VRAM assert will catch leak): %r",
+                        indices, exc,
                     )
             # Step 4: release memory.
             ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])

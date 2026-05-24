@@ -71,6 +71,21 @@ def _split_pools_for_dual(
             f"need {needed} GPUs for 2 pipelines (each infer_pool={infer_pool_size}), "
             f"have num_gpus_per_node={num_gpus_per_node}"
         )
+    # F9 (m11-review.review-report.md §2): silent GPU leak when
+    # num_gpus_per_node is not exactly 2*infer_pool_size. Prior behavior
+    # took the first 2*infer_pool_size GPUs and silently ignored the rest
+    # (e.g. on a 5-GPU box with infer_pool_size=2, GPU 4 would be
+    # invisible to both pipelines, never freed back to the rlix scheduler).
+    # Reject odd / extra-GPU layouts explicitly so the operator knows to
+    # either re-shape the smoke (use the overlap env path) or shrink to a
+    # supported count.
+    if num_gpus_per_node != needed:
+        raise ValueError(
+            f"_split_pools_for_dual requires num_gpus_per_node ({num_gpus_per_node}) "
+            f"== 2 * infer_pool_size ({needed}); extra GPUs would be silently "
+            f"ignored. Use MILES_DUAL_P*_{{TRAIN,INFER}} env vars to specify "
+            f"explicit pool mappings instead (see _overlap_pools_from_env)."
+        )
     physical = list(range(num_gpus_per_node))
     return list(physical[:infer_pool_size]), list(physical[infer_pool_size : 2 * infer_pool_size])
 
