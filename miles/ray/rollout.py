@@ -1031,22 +1031,32 @@ class RolloutManager:
                     )
             # Step 4: release memory.
             ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
-            # Step 5: optional post-sleep VRAM assert.
+            # Step 5: optional post-sleep VRAM hard gate. Gate on each
+            # engine's REAL per-process resident GPU memory (nvidia-smi
+            # compute-apps over the SGLang process tree), NOT /server_info
+            # accounting — the latter reports KV static-pool size and does
+            # not drop after a torch_memory_saver pause, so it falsely shows
+            # ~9 GiB for an offloaded 0.5B engine whose process is actually
+            # ~1.8 GiB resident. fail-open: an unmeasurable engine (PID-
+            # namespace mismatch / no nvidia-smi) returns None and is skipped
+            # rather than killing a healthy pipeline.
             if post_sleep_vram_threshold_gb is not None:
-                observed_vram_gbs = ray.get(
+                observed_resident_gbs = ray.get(
                     [
-                        h.assert_post_sleep_vram_below_threshold.remote(
+                        h.assert_post_sleep_process_vram_below_threshold.remote(
                             threshold_gb=post_sleep_vram_threshold_gb
                         )
                         for h in handles
                     ]
                 )
+                measured = [v for v in observed_resident_gbs if v is not None]
                 logger.info(
-                    "shrink_engines: post-sleep SGLang residual allocation "
-                    "max=%.3f GiB per_engine=%s threshold=%.3f GiB "
-                    "engine_indices=%s (weight+kvcache+graph)",
-                    max(observed_vram_gbs) if observed_vram_gbs else 0.0,
-                    [round(float(v), 3) for v in observed_vram_gbs],
+                    "shrink_engines: post-sleep process-resident GPU residual "
+                    "max=%s GiB per_engine=%s threshold=%.3f GiB "
+                    "engine_indices=%s (real resident; server_info accounting "
+                    "logged per-engine)",
+                    ("%.3f" % max(measured)) if measured else "n/a",
+                    [None if v is None else round(float(v), 3) for v in observed_resident_gbs],
                     float(post_sleep_vram_threshold_gb),
                     indices,
                 )

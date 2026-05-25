@@ -15,6 +15,7 @@ from urllib3.exceptions import NewConnectionError
 
 from miles.backends.megatron_utils.lora_utils import LORA_ADAPTER_NAME, convert_target_modules_to_hf, is_lora_enabled
 from miles.ray.ray_actor import RayActor
+from miles.utils.gpu_probe import query_process_tree_gpu_used_gb
 from miles.utils.env_report import collect_and_print_node_env_report
 from miles.utils.http_utils import get_host_info
 
@@ -755,6 +756,93 @@ class SGLangEngine(RayActor):
                 f"have leaked. Check release_memory_occupation tags."
             )
         return observed_max_gb
+
+    def _server_info_residual_gb(self, timeout_s: float = 5.0):
+        """SGLang /server_info weight+kvcache+graph, max across DPs (GiB).
+
+        This is *accounting* (KV static-pool size). It does NOT drop after a
+        torch_memory_saver pause, so it is logged for diagnostics only and is
+        never used as a hard gate. Returns None if unavailable.
+        """
+        try:
+            body = self.get_server_info()
+        except Exception:
+            return None
+        internal_states = body.get("internal_states") if isinstance(body, dict) else None
+        if not isinstance(internal_states, list) or not internal_states:
+            return None
+        observed_max_gb = 0.0
+        for state in internal_states:
+            mem = state.get("memory_usage") if isinstance(state, dict) else None
+            if not isinstance(mem, dict):
+                continue
+            total_gb = sum(float(mem.get(k, 0.0) or 0.0) for k in ("weight", "kvcache", "graph"))
+            observed_max_gb = max(observed_max_gb, total_gb)
+        return observed_max_gb
+
+    def get_process_tree_gpu_used_gb(self, timeout_s: float = 5.0):
+        """Real resident GPU memory (GiB) of this engine's SGLang process
+        tree, via nvidia-smi compute-apps (see ``miles.utils.gpu_probe``).
+
+        Returns ``None`` (fail-open) when unmeasurable — nvidia-smi missing or
+        a PID-namespace mismatch inside a container. Callers MUST treat
+        ``None`` as "cannot measure", never as 0.
+        """
+        root = getattr(self, "process", None)
+        return query_process_tree_gpu_used_gb(
+            getattr(root, "pid", None), timeout_s=timeout_s
+        )
+
+    def assert_post_sleep_process_vram_below_threshold(
+        self, threshold_gb: float, timeout_s: float = 5.0
+    ):
+        """Hard gate (fail-open) on this engine's REAL resident GPU memory
+        after ``release_memory_occupation``, measured per-process via
+        ``nvidia-smi`` compute-apps over the engine's process tree.
+
+        Behavior:
+        - non-rank-0 node: no-op, return None.
+        - measurable and > threshold: raise RuntimeError.
+        - measurable and <= threshold: return observed GiB.
+        - NOT measurable (nvidia-smi missing / parse fail / PID-namespace
+          mismatch): fail-open — log a warning and return None WITHOUT
+          raising, so a missing metric never kills a healthy pipeline
+          (engine-state polling stays the liveness gate).
+
+        ``/server_info`` accounting is logged alongside as diagnostic.
+        """
+        if self.node_rank != 0:
+            return None
+        _log = logging.getLogger(__name__)
+        account_gb = self._server_info_residual_gb(timeout_s=timeout_s)
+        resident_gb = self.get_process_tree_gpu_used_gb(timeout_s=timeout_s)
+        _log.info(
+            "post-sleep residual engine=%s:%s process_resident=%s GiB "
+            "server_info_accounting(weight+kvcache+graph)=%s GiB threshold=%.3f GiB",
+            self.server_host,
+            self.server_port,
+            ("%.3f" % resident_gb) if resident_gb is not None else "n/a",
+            ("%.3f" % account_gb) if account_gb is not None else "n/a",
+            float(threshold_gb),
+        )
+        if resident_gb is None:
+            _log.warning(
+                "post-sleep process-resident probe unavailable on engine "
+                "%s:%s (nvidia-smi missing or PID-namespace mismatch); "
+                "skipping hard gate (fail-open).",
+                self.server_host,
+                self.server_port,
+            )
+            return None
+        if resident_gb > float(threshold_gb):
+            raise RuntimeError(
+                f"Post-sleep process-resident GPU memory {resident_gb:.3f} GiB "
+                f"exceeds threshold {float(threshold_gb):.3f} GiB on engine "
+                f"{self.server_host}:{self.server_port} — offload did not free "
+                f"this engine's GPU memory (check release_memory_occupation / "
+                f"torch_memory_saver)."
+            )
+        return resident_gb
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """
