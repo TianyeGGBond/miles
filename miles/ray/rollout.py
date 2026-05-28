@@ -1008,25 +1008,29 @@ class RolloutManager:
                 #     persistent token-pool buffers); then halts new batch
                 #     dispatch. The scheduler thread keeps running but does not
                 #     spawn new work.
-                #   - Idempotent (documented intent per the prior comment
-                #     "if SGLang rejects the request e.g. already paused";
-                #     NOT empirically verified across all sglang versions).
-                #   - 4xx ONLY on misuse (unknown mode, missing engine). 5xx
-                #     means SGLang internal error — caller should escalate
-                #     (current path swallows; future M11.5 hardening should
-                #     differentiate 4xx vs 5xx).
-                # Caught Exception is intentionally broad here because the
-                # release sequence MUST continue: without release, the
-                # scheduler ledger leaks. We log at WARNING; the post-sleep
-                # VRAM assert (step 5) will catch any actual memory leak.
+                # Treat only the known idempotent "already paused" family
+                # as non-fatal. Other pause failures mean SGLang may not
+                # have reached the safe checkpoint, so releasing memory
+                # could still race Triton kernels; let the outer except
+                # reset abort-idempotency and fail this shrink cycle.
                 try:
                     ray.get([h.pause_generation.remote(mode="retract") for h in handles])
                 except Exception as exc:  # noqa: BLE001
+                    msg = str(exc).lower()
+                    idempotent_pause_error = (
+                        "already paused" in msg
+                        or "paused already" in msg
+                        or "generation is paused" in msg
+                    )
+                    if not idempotent_pause_error:
+                        raise RuntimeError(
+                            "pause_generation failed; refusing to release memory"
+                        ) from exc
                     import logging as _lg
                     _lg.getLogger(__name__).warning(
                         "shrink_engines: pause_generation pre-release failed "
-                        "(engine_indices=%s, swallowing to keep release path "
-                        "unblocked; post-sleep VRAM assert will catch leak): %r",
+                        "with idempotent already-paused response; continuing "
+                        "release path (engine_indices=%s): %r",
                         indices, exc,
                     )
             # Step 4: release memory.
