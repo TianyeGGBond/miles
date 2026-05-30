@@ -1031,19 +1031,15 @@ class RolloutManager:
                     )
             # Step 4: release memory.
             ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
-            # Step 5: optional post-sleep VRAM hard gate. Gate on each
-            # engine's REAL per-process resident GPU memory (nvidia-smi
-            # compute-apps over the SGLang process tree), NOT /server_info
-            # accounting — the latter reports KV static-pool size and does
-            # not drop after a torch_memory_saver pause, so it falsely shows
-            # ~9 GiB for an offloaded 0.5B engine whose process is actually
-            # ~1.8 GiB resident. fail-open: an unmeasurable engine (PID-
-            # namespace mismatch / no nvidia-smi) returns None and is skipped
-            # rather than killing a healthy pipeline.
+            # Step 5: attribution diagnostics. The hard residual gate is
+            # whole-GPU memory.used in RLix; this logs each SGLang engine's
+            # process-resident memory and /server_info accounting so a high
+            # whole-GPU residual can be attributed to SGLang vs non-SGLang
+            # co-tenants (Megatron/Miles/vLLM/orphan processes).
             if post_sleep_vram_threshold_gb is not None:
                 observed_resident_gbs = ray.get(
                     [
-                        h.assert_post_sleep_process_vram_below_threshold.remote(
+                        h.log_post_sleep_residual_diagnostics.remote(
                             threshold_gb=post_sleep_vram_threshold_gb
                         )
                         for h in handles
@@ -1051,10 +1047,10 @@ class RolloutManager:
                 )
                 measured = [v for v in observed_resident_gbs if v is not None]
                 logger.info(
-                    "shrink_engines: post-sleep process-resident GPU residual "
-                    "max=%s GiB per_engine=%s threshold=%.3f GiB "
-                    "engine_indices=%s (real resident; server_info accounting "
-                    "logged per-engine)",
+                    "shrink_engines: post-sleep SGLang residual diagnostics "
+                    "process_resident_max=%s GiB per_engine=%s "
+                    "whole_gpu_threshold=%.3f GiB engine_indices=%s "
+                    "(whole-GPU hard gate runs in RLix)",
                     ("%.3f" % max(measured)) if measured else "n/a",
                     [None if v is None else round(float(v), 3) for v in observed_resident_gbs],
                     float(post_sleep_vram_threshold_gb),

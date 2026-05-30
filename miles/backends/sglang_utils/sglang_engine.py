@@ -780,67 +780,44 @@ class SGLangEngine(RayActor):
             observed_max_gb = max(observed_max_gb, total_gb)
         return observed_max_gb
 
-    def get_process_tree_gpu_used_gb(self, timeout_s: float = 5.0):
-        """Real resident GPU memory (GiB) of this engine's SGLang process
-        tree, via nvidia-smi compute-apps (see ``miles.utils.gpu_probe``).
-
-        Returns ``None`` (fail-open) when unmeasurable — nvidia-smi missing or
-        a PID-namespace mismatch inside a container. Callers MUST treat
-        ``None`` as "cannot measure", never as 0.
-        """
-        root = getattr(self, "process", None)
-        return query_process_tree_gpu_used_gb(
-            getattr(root, "pid", None), timeout_s=timeout_s
-        )
-
-    def assert_post_sleep_process_vram_below_threshold(
-        self, threshold_gb: float, timeout_s: float = 5.0
+    def log_post_sleep_residual_diagnostics(
+        self, threshold_gb: float | None = None, timeout_s: float = 5.0
     ):
-        """Hard gate (fail-open) on this engine's REAL resident GPU memory
-        after ``release_memory_occupation``, measured per-process via
-        ``nvidia-smi`` compute-apps over the engine's process tree.
+        """Log attribution diagnostics after ``release_memory_occupation``.
 
-        Behavior:
-        - non-rank-0 node: no-op, return None.
-        - measurable and > threshold: raise RuntimeError.
-        - measurable and <= threshold: return observed GiB.
-        - NOT measurable (nvidia-smi missing / parse fail / PID-namespace
-          mismatch): fail-open — log a warning and return None WITHOUT
-          raising, so a missing metric never kills a healthy pipeline
-          (engine-state polling stays the liveness gate).
+        The hard residual gate is whole-GPU ``memory.used`` in RLix. This
+        engine-side diagnostic still records this SGLang process tree's real
+        resident GPU memory and ``/server_info`` accounting so high whole-GPU
+        residual can be attributed to SGLang vs non-SGLang co-tenants.
 
-        ``/server_info`` accounting is logged alongside as diagnostic.
+        Returns the measured process-resident GiB, or ``None`` when
+        unmeasurable (nvidia-smi missing / PID-namespace mismatch).
         """
         if self.node_rank != 0:
             return None
         _log = logging.getLogger(__name__)
         account_gb = self._server_info_residual_gb(timeout_s=timeout_s)
-        resident_gb = self.get_process_tree_gpu_used_gb(timeout_s=timeout_s)
+        root = getattr(self, "process", None)
+        resident_gb = query_process_tree_gpu_used_gb(
+            getattr(root, "pid", None), timeout_s=timeout_s
+        )
         _log.info(
-            "post-sleep residual engine=%s:%s process_resident=%s GiB "
-            "server_info_accounting(weight+kvcache+graph)=%s GiB threshold=%.3f GiB",
+            "post-sleep residual diagnostic engine=%s:%s "
+            "process_resident=%s GiB "
+            "server_info_accounting(weight+kvcache+graph)=%s GiB "
+            "whole_gpu_threshold=%s GiB",
             self.server_host,
             self.server_port,
             ("%.3f" % resident_gb) if resident_gb is not None else "n/a",
             ("%.3f" % account_gb) if account_gb is not None else "n/a",
-            float(threshold_gb),
+            ("%.3f" % float(threshold_gb)) if threshold_gb is not None else "n/a",
         )
         if resident_gb is None:
             _log.warning(
-                "post-sleep process-resident probe unavailable on engine "
-                "%s:%s (nvidia-smi missing or PID-namespace mismatch); "
-                "skipping hard gate (fail-open).",
+                "post-sleep process-resident diagnostic unavailable on engine "
+                "%s:%s (nvidia-smi missing or PID-namespace mismatch).",
                 self.server_host,
                 self.server_port,
-            )
-            return None
-        if resident_gb > float(threshold_gb):
-            raise RuntimeError(
-                f"Post-sleep process-resident GPU memory {resident_gb:.3f} GiB "
-                f"exceeds threshold {float(threshold_gb):.3f} GiB on engine "
-                f"{self.server_host}:{self.server_port} — offload did not free "
-                f"this engine's GPU memory (check release_memory_occupation / "
-                f"torch_memory_saver)."
             )
         return resident_gb
 
