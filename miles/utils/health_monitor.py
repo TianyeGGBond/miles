@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 
 import ray
 
@@ -29,6 +30,7 @@ class RolloutHealthMonitor:
         self._check_interval = args.rollout_health_check_interval
         self._check_timeout = args.rollout_health_check_timeout
         self._check_first_wait = args.rollout_health_check_first_wait
+        self._kill_drain_grace_seconds = getattr(args, "rollout_health_kill_drain_grace_seconds", 2.0)
         self._need_first_wait = True  # Need to wait after each resume
         self._is_checking_enabled = False  # Track if health checking should be active
 
@@ -159,19 +161,33 @@ class RolloutHealthMonitor:
 
     def _kill_engine(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")
-        for i in range(
-            rollout_engine_id * self._server_group.nodes_per_engine,
-            (rollout_engine_id + 1) * self._server_group.nodes_per_engine,
-        ):
+        start = rollout_engine_id * self._server_group.nodes_per_engine
+        end = (rollout_engine_id + 1) * self._server_group.nodes_per_engine
+        targets = []
+
+        for i in range(start, end):
             engine = self._server_group.all_engines[i]
             if engine:
-                logger.info(f"Shutting down and killing engine at index {i}")
-                try:
-                    ray.get(engine.shutdown.remote())
-                    ray.kill(engine)
-                    logger.info(f"Successfully killed engine at index {i}")
-                except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
+                targets.append((i, engine))
             else:
                 logger.info(f"Engine at index {i} is already None")
+
+        for i, engine in targets:
+            logger.info(f"Disabling router admission for engine at index {i}")
+            try:
+                ray.get(engine.unregister_from_router.remote(), timeout=2.0)
+            except Exception as e:
+                logger.warning(f"Fail to disable router admission for engine at index {i} (e: {e})")
+
+        if targets and self._kill_drain_grace_seconds > 0:
+            time.sleep(self._kill_drain_grace_seconds)
+
+        for i, engine in targets:
+            logger.info(f"Shutting down and killing engine at index {i}")
+            try:
+                ray.get(engine.shutdown.remote(), timeout=10.0)
+                ray.kill(engine)
+                logger.info(f"Successfully killed engine at index {i}")
+            except Exception as e:
+                logger.warning(f"Fail to kill engine at index {i} (e: {e})")
             self._server_group.all_engines[i] = None

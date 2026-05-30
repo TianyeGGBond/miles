@@ -586,6 +586,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=0,
                 help="Initial grace period (in seconds) before starting health checks. This allows time for model compilation and initialization. Increase this value significantly when using deepgemm.",
             )
+            parser.add_argument(
+                "--rollout-health-kill-drain-grace-seconds",
+                type=float,
+                default=2.0,
+                help="Best-effort grace period after disabling router admission and before hard-killing an unhealthy rollout engine.",
+            )
             return parser
 
         # data
