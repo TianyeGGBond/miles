@@ -591,15 +591,9 @@ class MilesRouter:
 
     def _finish_url(self, url):
         """Mark the request to the given URL as finished"""
-        if url not in self.worker_request_counts:
-            # remove_worker may have raced; tolerate.
-            return
+        assert url in self.worker_request_counts, f"URL {url} not recognized"
         self.worker_request_counts[url] -= 1
-        if self.worker_request_counts[url] < 0:
-            # The negative check is tight in standalone but in RLix mode the
-            # disable→remove→re-add ordering could theoretically race. Keep
-            # the assert form so the test suite catches regressions.
-            raise AssertionError(f"URL {url} count went negative")
+        assert self.worker_request_counts[url] >= 0, f"URL {url} count went negative"
 
 
 if __name__ == "__main__":

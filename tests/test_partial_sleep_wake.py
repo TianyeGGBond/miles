@@ -96,6 +96,19 @@ class TestRouterAdmissionLifecycle(unittest.TestCase):
         self.assertNotIn("http://w1:8000", router.enabled_workers)
         self.assertNotIn("http://w1:8000", router.worker_engine_index_map)
 
+    def test_finish_url_asserts_unknown_worker(self):
+        router = self._build_router()
+
+        with self.assertRaises(AssertionError):
+            router._finish_url("http://missing:8000")
+
+    def test_finish_url_asserts_negative_count(self):
+        router = self._build_router()
+        router.worker_request_counts["http://w1:8000"] = 0
+
+        with self.assertRaises(AssertionError):
+            router._finish_url("http://w1:8000")
+
 
 class TestSchedulerPreemptClassification(unittest.TestCase):
     """F3 / F31 — _is_scheduler_preempt strict missing-metadata check."""
