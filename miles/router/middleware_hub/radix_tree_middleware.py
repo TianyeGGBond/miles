@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -64,9 +65,7 @@ class RadixTreeMiddleware(BaseHTTPMiddleware):
         # cache state would survive scheduler shrink/expand. Re-enabling
         # under RLix mode requires a partial_rollout + radix_tree adapter
         # (not in scope for any current milestone).
-        import os as _os  # local import — module top imports must change
-
-        if _os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+        if os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
             raise RuntimeError(
                 "RadixTreeMiddleware is forbidden in RLix mode "
                 "(RLIX_CONTROL_PLANE=rlix). partial_rollout + radix_tree "
