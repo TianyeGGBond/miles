@@ -1,9 +1,11 @@
 """CPU bucket cache for HF-format training weights.
 
-The cache_owner train rank stores the latest step's buckets. Other ranks
-only advance their ready-step marker after participating in the gather.
-Bucket payloads do not carry a weight version; the rollout manager
-publishes the version once after the sync finishes.
+Contract:
+- only the cache_owner train rank stores non-empty buckets;
+- only the latest ready step is retained and readable;
+- bucket payloads do not carry weight versions;
+- tmpfs payload files use the ``miles_cpu_bucket_`` prefix for receiver
+  handoff and leak detection.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# F66 — leak-detection-friendly file naming for the cpu_serialize transport.
+# Leak-detection-friendly file naming for the cpu_serialize transport.
 TMPFS_FILE_PREFIX = "miles_cpu_bucket_"
 
 
@@ -30,9 +32,8 @@ class BucketEntry:
     (or pinned RAM). The tensors are HF-format (post Megatron→HF
     conversion); receivers load them by name.
 
-    ``size_bytes`` is the post-conversion total payload size used for the
-    F10 startup S2 / S3a-2 capacity checks; ``element_count`` is the
-    count of scalar elements (debug-only).
+    ``size_bytes`` is the post-conversion total payload size; ``element_count``
+    is the count of scalar elements (debug-only).
     """
 
     bucket_index: int
@@ -175,12 +176,11 @@ class CPUBucketCache:
 
     @staticmethod
     def make_tmpfs_filename(bucket_index: int, *, suffix: str = ".pt") -> str:
-        """F66: produce a leak-detection-friendly tmpfs file name.
+        """Produce a leak-detection-friendly tmpfs file name.
 
-        Used by :class:`MilesModelUpdateService` (iter 19) when
-        materializing a bucket onto ``/dev/shm`` for the cpu_serialize
-        transport. The wrapper code is responsible for ``try/finally
-        os.unlink`` of the returned path; the SGLang server-side route
-        only reads.
+        Used when materializing a bucket onto ``/dev/shm`` for the
+        cpu_serialize transport. The wrapper code is responsible for
+        ``try/finally os.unlink`` of the returned path; the SGLang
+        server-side route only reads.
         """
         return f"{TMPFS_FILE_PREFIX}{bucket_index:04d}_{uuid.uuid4().hex}{suffix}"
