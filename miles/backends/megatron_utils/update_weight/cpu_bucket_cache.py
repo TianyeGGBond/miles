@@ -1,41 +1,9 @@
-"""F4 CPU bucket cache — HF-format weight buckets keyed by training step.
+"""CPU bucket cache for HF-format training weights.
 
-The cache_owner rank (pp0 + dp0 + tp0 + cp0 — see F18 / scope F18 cache_owner
-uniqueness) builds and stores buckets after every training step the
-RLix scheduler asks for. Receivers (SGLang engines) load the buckets
-during the F4-F6 selective sync atomic unit driven by
-:class:`MilesModelUpdateService`.
-
-Design invariants
------------------
-
-- **Single ready slot** (``_cache_ready_step``): only the most recently
-  built step is exposed for sync. Pipelines do not pin historical
-  versions — the M11.1 SLA is base v=-1 plus the latest training step.
-  Lookup by any other step raises.
-- **Per-bucket payload contains NO ``weight_version``** (scope F21). The
-  weight_version is published exactly once per sync via
-  ``manager.set_weight_version`` at the end of the atomic unit, never
-  per-bucket.
-- **HF-format gather** (scope F18): names + shapes + dtypes are HF /
-  HuggingFace conventions, not Megatron-internal. The Megatron→HF
-  conversion runs upstream in
-  :class:`MegatronTrainRayActor.build_cpu_bucket_cache` (iter 11) and
-  passes already-converted tensors into :meth:`CPUBucketCache.put`.
-- **Cache owner uniqueness**: only the cache_owner rank actually stores
-  bucket data. Non-cache_owner ranks instantiate their own
-  :class:`CPUBucketCache` for per-rank state, but they MUST NOT call
-  ``put`` — the receive-side ``run_sync_session`` body (iter 12) drives
-  data transport through the cache_owner only.
-- **No per-rank version inversion** (scope F20): publishing a new
-  ``_cache_ready_step`` MUST happen inside the same critical section
-  that wrote the bucket list. The class itself is single-method-single-
-  critical-section friendly: ``put_step`` builds and publishes
-  atomically; ``get_step`` is a pure read.
-- **Tmpfs naming convention** (scope F66): callers that materialize
-  bucket payloads to ``/dev/shm`` for the cpu_serialize transport
-  use the format ``miles_cpu_bucket_{uuid}.pt`` so leak detection is
-  grep-friendly (``ls /dev/shm | grep miles_cpu_bucket_``).
+The cache_owner train rank stores the latest step's buckets. Other ranks
+only advance their ready-step marker after participating in the gather.
+Bucket payloads do not carry a weight version; the rollout manager
+publishes the version once after the sync finishes.
 """
 
 from __future__ import annotations
@@ -94,15 +62,8 @@ class CPUBucketCache:
     Only the cache_owner rank holds non-empty buckets. Other ranks
     instantiate this class but call ``put_empty_step`` so their
     ``_cache_ready_step`` advances in lockstep without retaining bucket
-    payloads.
-
-    Thread safety: a single ``threading.Lock`` guards bucket + ready-step
-    mutation. The cache_owner builds buckets serially during a training
-    step (Megatron->HF gather is collective; the lock serializes
-    publishing within the actor process). Read-side lookup
-    (:meth:`get_step` / :meth:`is_ready_for`) is also lock-guarded so
-    publish/lookup races against ``MilesModelUpdateService`` see a
-    consistent snapshot.
+    payloads. The internal lock protects the bucket list and ready-step
+    marker as one piece of state.
     """
 
     def __init__(self, *, max_bucket_size_bytes: int):
@@ -143,13 +104,7 @@ class CPUBucketCache:
 
         Discards any prior step's data (single-ready-slot invariant).
         Validates that bucket sizes do not exceed
-        ``max_bucket_size_bytes`` so the F10 startup capacity check
-        (S2 / S3a-2) holds at runtime too.
-
-        Atomic: the bucket-list write and the ``_cache_ready_step``
-        advance happen in the same critical section so concurrent
-        readers see either the old (step, buckets) tuple or the new
-        one — never a torn state.
+        ``max_bucket_size_bytes``.
         """
         bucket_list = list(buckets)
         for entry in bucket_list:
@@ -176,10 +131,7 @@ class CPUBucketCache:
 
         Used by non-cache_owner ranks: they participate in the collective
         gather (so the cache_owner can produce HF-format weights) but
-        discard the locally-constructed tensors. Their
-        ``_cache_ready_step`` still advances in lockstep so the rest of
-        the F4-F6 atomic unit can verify cross-rank readiness if it
-        wants to.
+        discard the locally-constructed tensors.
         """
         step_int = int(step)
         with self._lock:
