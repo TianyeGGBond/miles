@@ -49,6 +49,31 @@ def is_rlix_mode() -> bool:
     return os.environ.get("RLIX_CONTROL_PLANE") == "rlix"
 
 
+def apply_rlix_offload_defaults(args: Any) -> None:
+    """Force rollout offload on under RLix so SGLang can release VRAM on shrink.
+
+    RLix time-sharing requires ``release_memory_occupation`` to actually return
+    VRAM to the OS, which only happens when each engine launched with
+    ``enable_memory_saver=True`` — and that flag is gated by
+    ``args.offload_rollout`` (see ``backends/sglang_utils/sglang_engine.py``).
+    Forcing it on under RLix means operators don't have to remember
+    ``--offload-rollout``; without it, ``release_memory_occupation`` is a silent
+    no-op and the first ``shrink_engines`` OOMs (M11.1 attempt-5 bug).
+
+    Mutates ``args`` in place to match the surrounding ``miles_validate_args``
+    normalization style. Idempotent: no-op when not in RLix mode or when offload
+    is already enabled. ``offload_train`` is intentionally left untouched — that
+    is a separate train-side knob with its own cost/benefit.
+    """
+    if is_rlix_mode() and not getattr(args, "offload_rollout", False):
+        logger.info(
+            "RLix mode (RLIX_CONTROL_PLANE=rlix): forcing offload_rollout=True so "
+            "SGLang launches with enable_memory_saver and shrink_engines can "
+            "release VRAM for actor_train."
+        )
+        args.offload_rollout = True
+
+
 def _train_devices(args: Any) -> set[int]:
     n_nodes = int(getattr(args, "actor_num_nodes", 1))
     per_node = int(getattr(args, "actor_num_gpus_per_node", 0))

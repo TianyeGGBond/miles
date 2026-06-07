@@ -38,6 +38,7 @@ from .lora_utils import is_lora_enabled
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import get_register_replay_list_func
+from .tms_utils import assert_tms_hook_mode_matches_arch
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
@@ -102,6 +103,9 @@ class MegatronTrainRayActor(TrainRayActor):
             import os as _os
 
             mode = _os.environ.get("MILES_TMS_HOOK_MODE")
+            # Fail fast on the preload-on-Blackwell segfault: a clear, actionable
+            # error beats a tracebackless SIGSEGV during build_cpu_bucket_cache.
+            assert_tms_hook_mode_matches_arch(mode)
             if mode in ("torch", "preload"):
                 logger.info(f"Set torch_memory_saver.hook_mode to {mode!r}")
                 torch_memory_saver.hook_mode = mode  # type: ignore[assignment]

@@ -15,6 +15,7 @@ from miles.utils.environ import enable_experimental_rollout_refactor
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import load_function
+from miles.utils.rlix_validation import apply_rlix_offload_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -2126,6 +2127,10 @@ def miles_validate_args(args):
         args.offload_train = False
     if args.offload_rollout is None:
         args.offload_rollout = False
+
+    # RLix-mode: force offload_rollout on so SGLang launches with
+    # enable_memory_saver and shrink_engines can actually release VRAM.
+    apply_rlix_offload_defaults(args)
 
     if args.offload_train:
         args.disable_grad_buffers_cpu_backup = True
