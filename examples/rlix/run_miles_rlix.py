@@ -63,8 +63,8 @@ def main():
     from miles.utils.rlix_validation import assert_rlix_topology
     from rlix.pipeline.miles_coordinator import MilesCoordinator
     from rlix.protocol.types import (
-        COORDINATOR_ACTOR_NAME_PREFIX,
         RLIX_NAMESPACE,
+        get_coordinator_actor_name,
         get_pipeline_namespace,
     )
 
@@ -188,17 +188,13 @@ def main():
             pipeline_runtime_env_vars[_k] = _v
     os.environ["PIPELINE_ID"] = str(pipeline_id)
     os.environ["ROLL_RAY_NAMESPACE"] = pipeline_namespace
-    # Coordinator name + namespace MUST match what the rlix scheduler
-    # uses to resolve the per-pipeline coordinator (scheduler.py:1213
-    # `f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}"` in the pipeline's
-    # registered ray_namespace). Otherwise resize_infer/shrink_engines
-    # RPCs from the scheduler fail with "Failed to resolve actor", and
-    # the central scheduling loop crashes when it tries to preempt
-    # GENERATION workers for an ACTOR_TRAINING request.
+    # Name + namespace must match how the rlix scheduler resolves this
+    # coordinator, or its resize_infer/shrink_engines RPCs fail to resolve
+    # the actor. Both sides build the name via get_coordinator_actor_name.
     coordinator = (
         ray.remote(MilesCoordinator)
         .options(
-            name=f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}",
+            name=get_coordinator_actor_name(pipeline_id),
             namespace=pipeline_namespace,
             lifetime="detached",
             num_cpus=0.01,

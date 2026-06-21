@@ -207,7 +207,7 @@ def _build_pipeline(
     ray,
     MilesCoordinator,
     MilesPipelineConfig,
-    COORDINATOR_ACTOR_NAME_PREFIX,
+    get_coordinator_actor_name,
     get_pipeline_namespace,
     logger,
 ):
@@ -301,7 +301,7 @@ def _build_pipeline(
     coordinator = (
         ray.remote(MilesCoordinator)
         .options(
-            name=f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}",
+            name=get_coordinator_actor_name(pipeline_id),
             namespace=pipeline_namespace,
             lifetime="detached",
             num_cpus=0.01,
@@ -351,7 +351,7 @@ def main():
     from miles.utils.rlix_validation import assert_rlix_topology
     from rlix.pipeline.miles_coordinator import MilesCoordinator
     from rlix.protocol.types import (
-        COORDINATOR_ACTOR_NAME_PREFIX,
+        get_coordinator_actor_name,
         get_pipeline_namespace,
     )
 
@@ -428,7 +428,7 @@ def main():
         ray=ray,
         MilesCoordinator=MilesCoordinator,
         MilesPipelineConfig=MilesPipelineConfig,
-        COORDINATOR_ACTOR_NAME_PREFIX=COORDINATOR_ACTOR_NAME_PREFIX,
+        get_coordinator_actor_name=get_coordinator_actor_name,
         get_pipeline_namespace=get_pipeline_namespace,
         logger=logger,
     )
@@ -441,7 +441,7 @@ def main():
         ray=ray,
         MilesCoordinator=MilesCoordinator,
         MilesPipelineConfig=MilesPipelineConfig,
-        COORDINATOR_ACTOR_NAME_PREFIX=COORDINATOR_ACTOR_NAME_PREFIX,
+        get_coordinator_actor_name=get_coordinator_actor_name,
         get_pipeline_namespace=get_pipeline_namespace,
         logger=logger,
     )
