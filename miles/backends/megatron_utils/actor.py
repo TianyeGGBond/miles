@@ -613,6 +613,11 @@ class MegatronTrainRayActor(TrainRayActor):
         rebuild. Bucket size cap comes from
         ``args.miles_model_update_bucket_size_mb`` (cf. F10 S2/S3a-2
         startup checks).
+
+        No actor-level lock guards ``build_cpu_bucket_cache`` /
+        ``run_sync_session``: train actors must stay default sync Ray actors
+        (no ``max_concurrency``), so Ray serializes their calls. The cache's
+        own lock protects its internal state.
         """
         if not hasattr(self, "_cpu_bucket_cache") or self._cpu_bucket_cache is None:
             from .update_weight.cpu_bucket_cache import CPUBucketCache
